@@ -662,12 +662,14 @@ class MenuList(MenuContainer):
 class MenuVSDList(MenuList):
     def __init__(self, manager, config, **kwargs):
         super(MenuVSDList, self).__init__(manager, config, **kwargs)
+        # order files by modification time (newest first) instead of by name
+        self._sort_by_date = config.getboolean('sort_by_date', False)
 
     def _populate(self):
         super(MenuVSDList, self)._populate()
         sdcard = self.manager.printer.lookup_object('virtual_sdcard', None)
         if sdcard is not None:
-            files = sdcard.get_file_list()
+            files = sdcard.get_file_list(sort_by_date=self._sort_by_date)
             for fname, fsize in files:
                 self.insert_item(self.manager.menuitem_from(
                     'command', name=repr(fname), gcode='M23 /%s' % str(fname)))

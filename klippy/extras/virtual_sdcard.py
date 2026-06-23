@@ -64,7 +64,7 @@ class VirtualSD:
         if self.work_timer is None:
             return False, ""
         return True, "sd_pos=%d" % (self.file_position,)
-    def get_file_list(self, check_subdirs=False):
+    def get_file_list(self, check_subdirs=False, sort_by_date=False):
         if check_subdirs:
             flist = []
             for root, dirs, files in os.walk(
@@ -77,15 +77,22 @@ class VirtualSD:
                     r_path = full_path[len(self.sdcard_dirname) + 1:]
                     size = os.path.getsize(full_path)
                     flist.append((r_path, size))
+            if sort_by_date:
+                return sorted(flist, key=lambda f: os.path.getmtime(
+                    os.path.join(self.sdcard_dirname, f[0])), reverse=True)
             return sorted(flist, key=lambda f: f[0].lower())
         else:
             dname = self.sdcard_dirname
             try:
                 filenames = os.listdir(self.sdcard_dirname)
-                return [(fname, os.path.getsize(os.path.join(dname, fname)))
-                        for fname in sorted(filenames, key=str.lower)
-                        if not fname.startswith('.')
-                        and os.path.isfile((os.path.join(dname, fname)))]
+                flist = [(fname, os.path.getsize(os.path.join(dname, fname)))
+                         for fname in filenames
+                         if not fname.startswith('.')
+                         and os.path.isfile((os.path.join(dname, fname)))]
+                if sort_by_date:
+                    return sorted(flist, key=lambda f: os.path.getmtime(
+                        os.path.join(dname, f[0])), reverse=True)
+                return sorted(flist, key=lambda f: f[0].lower())
             except:
                 logging.exception("virtual_sdcard get_file_list")
                 raise self.gcode.error("Unable to get file list")
