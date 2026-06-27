@@ -825,6 +825,19 @@ above the supplied MINIMUM and/or at or below the supplied MAXIMUM.
 [TARGET=<target_temperature>]`: Sets the target temperature for a
 heater. If a target temperature is not supplied, the target is 0.
 
+### [verify_heater]
+
+The following command is available when a
+[verify_heater config section](Config_Reference.md#verify_heater) is
+enabled.
+
+#### SET_HEATER_VERIFICATION
+`SET_HEATER_VERIFICATION HEATER=<heater_name> [ENABLE=<0|1>]`: Enable or
+disable heater verification for the given heater at run time. Set
+`ENABLE=0` to suspend the check (for example, around a print that heats a
+chamber heater to a target it cannot physically reach) and `ENABLE=1` to
+resume it. If ENABLE is not supplied it defaults to 1 (enabled).
+
 ### [idle_timeout]
 
 The idle_timeout module is automatically loaded.

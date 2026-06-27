@@ -2678,6 +2678,13 @@ printer. Use verify_heater sections to change the default settings.
 
 ```
 [verify_heater heater_config_name]
+#enable: True
+#   Enable heater verification for this heater. Set to False to disable
+#   the check entirely - useful for a heater (such as a chamber or
+#   enclosure heater) that may not be able to reach or maintain its
+#   requested target temperature. Verification can also be toggled at
+#   run time with the SET_HEATER_VERIFICATION command. The default is
+#   True.
 #max_error: 120
 #   The maximum "cumulative temperature error" before raising an
 #   error. Smaller values result in stricter checking and larger
