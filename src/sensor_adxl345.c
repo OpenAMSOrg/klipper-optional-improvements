@@ -12,12 +12,15 @@
 #include "sched.h" // DECL_TASK
 #include "sensor_bulk.h" // sensor_bulk_report
 #include "spicmds.h" // spidev_transfer
+#include "trigger_analog.h" // trigger_analog_update
 
 struct adxl345 {
     struct timer timer;
     uint32_t rest_ticks;
     struct spidev_s *spi;
     uint8_t flags;
+    struct trigger_analog *ta;
+    uint8_t ta_axis;
     struct sensor_bulk sb;
 };
 
@@ -91,6 +94,10 @@ adxl_query(struct adxl345 *ax, uint8_t oid)
         d[2] = msg[5]; // z low bits
         d[3] = (msg[2] & 0x1f) | (msg[6] << 5); // x high bits and z high bits
         d[4] = (msg[4] & 0x1f) | ((msg[6] << 2) & 0x60); // y high and z high
+        // Report selected axis for homing/probing trigger checks
+        uint_fast8_t an = ax->ta_axis * 2;
+        int32_t aval = (int16_t)((msg[an + 2] << 8) | msg[an + 1]);
+        trigger_analog_update(ax->ta, aval);
     }
     ax->sb.data_count += BYTES_PER_SAMPLE;
     if (ax->sb.data_count + BYTES_PER_SAMPLE > ARRAY_SIZE(ax->sb.data))
@@ -125,6 +132,21 @@ command_query_adxl345(uint32_t *args)
     adxl_reschedule_timer(ax);
 }
 DECL_COMMAND(command_query_adxl345, "query_adxl345 oid=%c rest_ticks=%u");
+
+void
+adxl345_attach_trigger_analog(uint32_t *args)
+{
+    struct adxl345 *ax = oid_lookup(args[0], command_config_adxl345);
+    ax->ta = trigger_analog_oid_lookup(args[1]);
+    uint8_t axis = args[2];
+    if (axis > 2)
+        shutdown("adxl345 trigger axis out of range 0-2");
+    ax->ta_axis = axis;
+}
+#if CONFIG_WANT_TRIGGER_ANALOG
+DECL_COMMAND(adxl345_attach_trigger_analog, "adxl345_attach_trigger_analog"
+             " oid=%c trigger_analog_oid=%c axis=%c");
+#endif
 
 void
 command_query_adxl345_status(uint32_t *args)
