@@ -14,13 +14,15 @@
 #include "spicmds.h" // spidev_transfer
 #include "trigger_analog.h" // trigger_analog_update
 
+#define ADXL_TA_SLOTS 2
+
 struct adxl345 {
     struct timer timer;
     uint32_t rest_ticks;
     struct spidev_s *spi;
     uint8_t flags;
-    struct trigger_analog *ta;
-    uint8_t ta_axis;
+    struct trigger_analog *ta[ADXL_TA_SLOTS];
+    uint8_t ta_axis[ADXL_TA_SLOTS];
     struct sensor_bulk sb;
 };
 
@@ -94,10 +96,14 @@ adxl_query(struct adxl345 *ax, uint8_t oid)
         d[2] = msg[5]; // z low bits
         d[3] = (msg[2] & 0x1f) | (msg[6] << 5); // x high bits and z high bits
         d[4] = (msg[4] & 0x1f) | ((msg[6] << 2) & 0x60); // y high and z high
-        // Report selected axis for homing/probing trigger checks
-        uint_fast8_t an = ax->ta_axis * 2;
-        int32_t aval = (int16_t)((msg[an + 2] << 8) | msg[an + 1]);
-        trigger_analog_update(ax->ta, aval);
+        // Report selected axes for homing/probing trigger checks
+        for (uint_fast8_t slot = 0; slot < ADXL_TA_SLOTS; slot++) {
+            if (!ax->ta[slot])
+                continue;
+            uint_fast8_t an = ax->ta_axis[slot] * 2;
+            int32_t aval = (int16_t)((msg[an + 2] << 8) | msg[an + 1]);
+            trigger_analog_update(ax->ta[slot], aval);
+        }
     }
     ax->sb.data_count += BYTES_PER_SAMPLE;
     if (ax->sb.data_count + BYTES_PER_SAMPLE > ARRAY_SIZE(ax->sb.data))
@@ -137,15 +143,17 @@ void
 adxl345_attach_trigger_analog(uint32_t *args)
 {
     struct adxl345 *ax = oid_lookup(args[0], command_config_adxl345);
-    ax->ta = trigger_analog_oid_lookup(args[1]);
-    uint8_t axis = args[2];
+    uint8_t axis = args[2], slot = args[3];
     if (axis > 2)
         shutdown("adxl345 trigger axis out of range 0-2");
-    ax->ta_axis = axis;
+    if (slot >= ADXL_TA_SLOTS)
+        shutdown("adxl345 trigger slot out of range");
+    ax->ta[slot] = trigger_analog_oid_lookup(args[1]);
+    ax->ta_axis[slot] = axis;
 }
 #if CONFIG_WANT_TRIGGER_ANALOG
 DECL_COMMAND(adxl345_attach_trigger_analog, "adxl345_attach_trigger_analog"
-             " oid=%c trigger_analog_oid=%c axis=%c");
+             " oid=%c trigger_analog_oid=%c axis=%c slot=%c");
 #endif
 
 void
