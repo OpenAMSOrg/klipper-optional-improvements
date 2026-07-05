@@ -185,10 +185,14 @@ config NEED_SENSOR_BULK
     depends on WANT_ADXL345 || WANT_LIS2DW || WANT_BMI160 || WANT_MPU9250 || WANT_ICM20948 \
         || WANT_HX71X || WANT_ADS1220 || WANT_ADS131M0X || WANT_LDC1612 || WANT_SENSOR_ANGLE
     default y
+config WANT_ADXL345_PROBE
+    bool "Support nozzle touch probing with the adxl345 accelerometer"
+    depends on WANT_ADXL345
+    default y
 config WANT_TRIGGER_ANALOG
     bool
     depends on WANT_ADC || WANT_HX71X || WANT_ADS1220 || WANT_ADS131M0X || WANT_LDC1612 \
-        || WANT_ADXL345
+        || WANT_ADXL345_PROBE
     default y
 config NEED_SOS_FILTER
     bool
@@ -273,11 +277,11 @@ config WANT_SENSOR_ANGLE
     depends on WANT_SPI
 comment "Other features"
     depends on WANT_ADC || WANT_HX71X || WANT_ADS1220 || WANT_ADS131M0X || WANT_LDC1612 \
-        || WANT_ADXL345
+        || WANT_ADXL345_PROBE
 config WANT_TRIGGER_ANALOG
     bool "Support for homing/probing events using analog sensors"
     depends on WANT_ADC || WANT_HX71X || WANT_ADS1220 || WANT_ADS131M0X || WANT_LDC1612 \
-        || WANT_ADXL345
+        || WANT_ADXL345_PROBE
 endmenu
 
 # Generic configuration options for CANbus

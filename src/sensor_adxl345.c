@@ -97,6 +97,7 @@ adxl_query(struct adxl345 *ax, uint8_t oid)
         d[3] = (msg[2] & 0x1f) | (msg[6] << 5); // x high bits and z high bits
         d[4] = (msg[4] & 0x1f) | ((msg[6] << 2) & 0x60); // y high and z high
         // Report selected axes for homing/probing trigger checks
+#if CONFIG_WANT_ADXL345_PROBE
         for (uint_fast8_t slot = 0; slot < ADXL_TA_SLOTS; slot++) {
             if (!ax->ta[slot])
                 continue;
@@ -104,6 +105,7 @@ adxl_query(struct adxl345 *ax, uint8_t oid)
             int32_t aval = (int16_t)((msg[an + 2] << 8) | msg[an + 1]);
             trigger_analog_update(ax->ta[slot], aval);
         }
+#endif
     }
     ax->sb.data_count += BYTES_PER_SAMPLE;
     if (ax->sb.data_count + BYTES_PER_SAMPLE > ARRAY_SIZE(ax->sb.data))
@@ -151,7 +153,7 @@ adxl345_attach_trigger_analog(uint32_t *args)
     ax->ta[slot] = trigger_analog_oid_lookup(args[1]);
     ax->ta_axis[slot] = axis;
 }
-#if CONFIG_WANT_TRIGGER_ANALOG
+#if CONFIG_WANT_ADXL345_PROBE
 DECL_COMMAND(adxl345_attach_trigger_analog, "adxl345_attach_trigger_analog"
              " oid=%c trigger_analog_oid=%c axis=%c slot=%c");
 #endif
