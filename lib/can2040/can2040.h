@@ -12,10 +12,15 @@ struct can2040_msg {
     };
 };
 
-enum {
-    CAN2040_ID_RTR = 1<<30,
-    CAN2040_ID_EFF = 1<<31,
-};
+/*
+ * The identifier flags occupy the high bits of a uint32_t message id.  These
+ * must be unsigned constants: a signed `1 << 31` has no representable int
+ * result and is undefined by C, so it is not a reliable extended-frame mask.
+ * Use macros instead of enum members because the C enum value range is also
+ * traditionally limited to values representable as int.
+ */
+#define CAN2040_ID_RTR (1u<<30)
+#define CAN2040_ID_EFF (1u<<31)
 
 enum {
     CAN2040_NOTIFY_RX = 1<<20,

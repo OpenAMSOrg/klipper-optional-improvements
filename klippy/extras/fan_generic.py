@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging
+import logging, math
 from . import fan, output_pin
 
 class PrinterFanGeneric:
@@ -27,6 +27,8 @@ class PrinterFanGeneric:
     def _template_update(self, text):
         try:
             value = float(text)
+            if math.isnan(value) or math.isinf(value):
+                raise ValueError("non-finite value")
         except ValueError as e:
             logging.exception("fan_generic template render error")
             value = 0.

@@ -27,7 +27,9 @@ class PrinterMotionQueuing:
         # C trapq tracking
         self.trapqs = []
         ffi_main, ffi_lib = chelper.get_ffi()
+        self.ffi_main = ffi_main
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
+        self.trapq_append_batch = ffi_lib.trapq_append_batch
         # C steppersync tracking
         self.steppersyncmgr = ffi_main.gc(ffi_lib.steppersyncmgr_alloc(),
                                           ffi_lib.steppersyncmgr_free)
@@ -71,6 +73,16 @@ class PrinterMotionQueuing:
     def lookup_trapq_append(self):
         ffi_main, ffi_lib = chelper.get_ffi()
         return ffi_lib.trapq_append
+    def append_trapq_moves(self, trapq, moves):
+        if not moves:
+            return
+        # Construct one contiguous native record array for this bounded host
+        # batch.  CFFI otherwise validates and converts thirteen Python
+        # arguments independently for every move before crossing into C.  The
+        # native helper consumes the records synchronously, so the temporary
+        # cdata owns them for exactly this call and needs no retained lifetime.
+        c_moves = self.ffi_main.new("struct trapq_append_move[]", moves)
+        self.trapq_append_batch(trapq, c_moves, len(moves))
     # C steppersync tracking
     def _lookup_steppersync(self, mcu):
         for ss_mcu, ss in self.steppersyncs:

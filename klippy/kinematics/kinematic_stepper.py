@@ -4,7 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import logging, re
+import logging, re, math
 import stepper, chelper
 
 def parse_carriages_string(carriages_str, printer_carriages, parse_error):
@@ -23,6 +23,8 @@ def parse_carriages_string(carriages_str, printer_carriages, parse_error):
         if len(term_lst) == 2:
             try:
                 coeff = float(term_lst[0])
+                if math.isnan(coeff) or math.isinf(coeff):
+                    raise ValueError
             except ValueError:
                 raise parse_error("Invalid float '%s'" % term_lst[0])
         else:

@@ -19,6 +19,32 @@
 
 #define CANBUS_UUID_LEN 6
 
+#define CAN_QUERY_RESPONSE_BITS 160
+#define CAN_QUERY_RESPONSE_WINDOW_US 1500000
+#define CAN_RX_COMMAND_BATCH 8
+
+enum {
+    CQS_IDLE, CQS_WAITING, CQS_READY
+};
+
+/*
+ * Unassigned nodes all transmit their discovery response with the same CAN
+ * identifier.  Arbitration therefore can not select one response by UUID:
+ * nodes whose payload bits differ instead detect an error during the data
+ * field and retry together.  Sending directly from the query handler would
+ * turn a normal broadcast into a synchronized collision storm on a bus with
+ * several unassigned devices.
+ *
+ * Keep explicit ownership of the one coalesced response while its randomized
+ * delay crosses scheduler contexts.  CQS_WAITING means the timer owns it and
+ * suppresses repeated queries, CQS_READY means the normal transmit task owns
+ * it (including controller-full retries), and CQS_IDLE means no discovery
+ * response is pending.  The timer only transfers ownership and wakes the
+ * transmit task; it must not bypass the CAN driver's task/wakeup contract by
+ * attempting I/O from the timer callback.
+ */
+static uint_fast8_t can_query_event(struct timer *timer);
+
 // Global storage
 static struct canbus_data {
     uint32_t assigned_id;
@@ -26,18 +52,26 @@ static struct canbus_data {
 
     // Tx data
     struct task_wake tx_wake;
-    uint8_t transmit_pos, transmit_max;
+    struct timer query_timer;
+    uint32_t query_number;
+    uint8_t transmit_pos, transmit_max, query_state, query_queued;
 
     // Rx data
     struct task_wake rx_wake;
-    uint8_t receive_pos;
+    uint8_t receive_pos, invalid_bitrate;
+    // Single-producer IRQ ring; publish indexes only after slot data is stable
     uint32_t admin_pull_pos, admin_push_pos;
+    uint32_t receive_overflows, admin_overflows;
 
     // Transfer buffers
     struct canbus_msg admin_queue[8];
     uint8_t transmit_buf[192];
     uint8_t receive_buf[192];
-} CanData;
+} CanData = {
+    .query_timer.func = can_query_event,
+};
+
+static int can_send_query_response(void);
 
 
 /****************************************************************
@@ -50,12 +84,36 @@ canserial_notify_tx(void)
     sched_wake_task(&CanData.tx_wake);
 }
 
+static uint_fast8_t
+can_query_event(struct timer *timer)
+{
+    CanData.query_state = CQS_READY;
+    canserial_notify_tx();
+    return SF_DONE;
+}
+
 void
 canserial_tx_task(void)
 {
     if (!sched_check_wake(&CanData.tx_wake))
         return;
     uint32_t id = CanData.assigned_id;
+    /*
+     * canbus_send() returning a negative value means that no frame was accepted
+     * and the controller will call canserial_notify_tx() when a transmit slot
+     * becomes available.  Busy-waiting here is therefore both unnecessary and
+     * dangerous: this is a cooperative scheduler task, so a full controller on
+     * a disconnected bus could otherwise prevent every other task, including
+     * shutdown processing, from running.  Retain one pending admin response and
+     * return to the scheduler.  Repeated queries coalesce into that response,
+     * and assigning the node makes the response obsolete instead of sending a
+     * stale unassigned-node announcement.
+     */
+    if (CanData.query_state == CQS_READY) {
+        if (!id && can_send_query_response() < 0)
+            return;
+        CanData.query_state = CQS_IDLE;
+    }
     if (!id) {
         CanData.transmit_pos = CanData.transmit_max = 0;
         return;
@@ -142,23 +200,59 @@ can_decode_nodeid(int nodeid)
     return (nodeid << 1) + 0x100;
 }
 
-static void
-can_process_query_unassigned(struct canbus_msg *msg)
+static int
+can_send_query_response(void)
 {
-    if (CanData.assigned_id)
-        return;
     struct canbus_msg send;
     send.id = CANBUS_ID_ADMIN_RESP;
     send.dlc = 8;
     send.data[0] = CANBUS_RESP_NEED_NODEID;
     memcpy(&send.data[1], CanData.uuid, sizeof(CanData.uuid));
     send.data[7] = CANBUS_CMD_SET_KLIPPER_NODEID;
-    // Send with retry
-    for (;;) {
-        int ret = canbus_send(&send);
-        if (ret >= 0)
-            return;
-    }
+    return canbus_send(&send);
+}
+
+static void
+can_process_query_unassigned(struct canbus_msg *msg)
+{
+    if (CanData.assigned_id || CanData.query_state != CQS_IDLE)
+        return;
+    /*
+     * Every discovery response uses CANBUS_ID_ADMIN_RESP.  CAN arbitration can
+     * therefore not select a winner when multiple responses become ready at
+     * the same bus-idle boundary; the controllers continue into the different
+     * UUID payloads and produce a data-bit collision instead.  A timer spacing
+     * shorter than one complete response does not prevent that condition,
+     * because every timer which expires while an earlier frame owns the bus
+     * becomes a simultaneous contender as soon as that frame finishes.
+     *
+     * Reserve 160 bit times per slot.  An eight-byte standard CAN data frame,
+     * including worst-case bit stuffing, acknowledgement, end-of-frame, and
+     * inter-frame spacing, fits within that conservative bound.  Scaling the
+     * slot duration by the configured bitrate makes the protection valid below
+     * the usual 1Mbit/s setting as well.  The fixed response window bounds
+     * discovery latency; at least one slot is retained for unusually low
+     * build-time bitrate settings.
+     */
+    uint32_t slot_us = DIV_ROUND_UP(CAN_QUERY_RESPONSE_BITS * 1000000u,
+                                    CONFIG_CANBUS_FREQUENCY);
+    uint32_t slot_count = CAN_QUERY_RESPONSE_WINDOW_US / slot_us;
+    if (!slot_count)
+        slot_count = 1;
+    /*
+     * A UUID-only slot is deterministic.  If two nodes happen to select the
+     * same slot, every later discovery query would reproduce the collision and
+     * neither node could ever be discovered.  Use the accepted-query count as
+     * a hash seed so each node follows a different deterministic slot sequence.
+     * This does not require a hardware random-number source, and a collision in
+     * one discovery round no longer forces the same collision on every retry.
+     */
+    uint32_t uuid_slot = fasthash64(CanData.uuid, sizeof(CanData.uuid),
+                                    CanData.query_number++);
+    uint32_t delay = 100 + uuid_slot % slot_count * slot_us;
+    CanData.query_state = CQS_WAITING;
+    CanData.query_timer.waketime = timer_read_time() + timer_from_us(delay);
+    sched_add_timer(&CanData.query_timer);
 }
 
 static void
@@ -223,6 +317,23 @@ canserial_notify_rx(void)
     sched_wake_task(&CanData.rx_wake);
 }
 
+void
+canserial_set_invalid_bitrate(void)
+{
+    /*
+     * Board initialization runs before sched_main() establishes the recovery
+     * point used by shutdown().  A CAN driver therefore can not safely call
+     * shutdown directly when its runtime peripheral clock can not represent
+     * the configured bitrate.  Publish the failure and wake this existing task;
+     * its first scheduler invocation occurs after shutdown handling is live.
+     * The driver returns before it programs or starts the CAN controller, so an
+     * invalid configuration can never place approximately timed frames on the
+     * bus even if its peripheral clock and pin mux were already prepared.
+     */
+    writeb(&CanData.invalid_bitrate, 1);
+    canserial_notify_rx();
+}
+
 DECL_CONSTANT("RECEIVE_WINDOW", ARRAY_SIZE(CanData.receive_buf));
 
 // Handle incoming data (called from IRQ handler)
@@ -234,21 +345,69 @@ canserial_process_data(struct canbus_msg *msg)
         // Add to incoming data buffer
         int rpos = CanData.receive_pos;
         uint32_t len = CANMSG_DATA_LEN(msg);
-        if (len > sizeof(CanData.receive_buf) - rpos)
+        if (len > sizeof(CanData.receive_buf) - rpos) {
+            CanData.receive_overflows++;
             return;
+        }
         memcpy(&CanData.receive_buf[rpos], msg->data, len);
         CanData.receive_pos = rpos + len;
         canserial_notify_rx();
     } else if (id == CANBUS_ID_ADMIN
                || (CanData.assigned_id && id == CanData.assigned_id + 1)) {
         // Add to admin command queue
+        int is_query = (id == CANBUS_ID_ADMIN && msg->dlc
+                        && msg->data[0] == CANBUS_CMD_QUERY_UNASSIGNED);
+        if (is_query) {
+            /*
+             * Discovery is a broadcast and scanners commonly repeat it while
+             * collecting delayed responses.  Queueing every copy until the
+             * task handles the first one can fill all eight admin slots with
+             * interchangeable work, causing a node-id assignment or conflict
+             * frame to be dropped.  Once one query is queued, timer-owned, or
+             * transmit-owned, it represents the complete discovery obligation
+             * for this node.  Assigned nodes have no obligation at all and can
+             * reject the broadcast before it consumes queue capacity.
+             *
+             * query_queued covers the interval before can_process_admin() has
+             * established query_state.  The receive interrupt is the only
+             * producer, and the task clears this marker only after processing
+             * that exact queue entry, so a newly accepted query can not hide
+             * an older response or disturb the randomized retry sequence.
+             */
+            if (CanData.assigned_id || readb(&CanData.query_queued)
+                || readb(&CanData.query_state) != CQS_IDLE)
+                return;
+        }
         uint32_t pushp = CanData.admin_push_pos;
-        if (pushp >= CanData.admin_pull_pos + ARRAY_SIZE(CanData.admin_queue))
-            // No space - drop message
+        /*
+         * The queue positions are monotonically increasing uint32_t counters,
+         * so they necessarily wrap on a sufficiently busy or long-lived bus.
+         * Adding the queue depth to admin_pull_pos before comparing can wrap
+         * that right-hand side first.  Near UINT32_MAX an empty queue would
+         * then appear full; because the producer stops advancing when full,
+         * admin reception could remain wedged permanently.  Unsigned
+         * subtraction preserves the small producer-consumer distance across
+         * rollover, which is safe because that distance is bounded by this
+         * eight-entry queue.
+         */
+        uint32_t pullp = readl(&CanData.admin_pull_pos);
+        if (pushp - pullp >= ARRAY_SIZE(CanData.admin_queue)) {
+            // No space - drop message and retain evidence for diagnostics
+            CanData.admin_overflows++;
             return;
+        }
         uint32_t pos = pushp % ARRAY_SIZE(CanData.admin_queue);
         memcpy(&CanData.admin_queue[pos], msg, sizeof(*msg));
-        CanData.admin_push_pos = pushp + 1;
+        if (is_query)
+            writeb(&CanData.query_queued, 1);
+        /*
+         * The task treats push_pos as proof that the complete queue slot is
+         * readable.  Use the I/O accessor as a compiler release barrier so the
+         * structure copy can not move after that publication.  This is an SPSC
+         * ring: only this receive interrupt advances push_pos, while only the
+         * task advances pull_pos, so no read-modify-write lock is required.
+         */
+        writel(&CanData.admin_push_pos, pushp + 1);
         canserial_notify_rx();
     }
 }
@@ -265,7 +424,6 @@ console_pop_input(int len)
             memmove(&CanData.receive_buf[copied]
                     , &CanData.receive_buf[copied + len], needcopy - copied);
             copied = needcopy;
-            canserial_notify_rx();
         }
         irqstatus_t flag = irq_save();
         if (rpos != readb(&CanData.receive_pos)) {
@@ -285,6 +443,8 @@ canserial_rx_task(void)
 {
     if (!sched_check_wake(&CanData.rx_wake))
         return;
+    if (readb(&CanData.invalid_bitrate))
+        shutdown("Invalid CAN bitrate");
 
     // Process pending admin messages
     for (;;) {
@@ -297,21 +457,48 @@ canserial_rx_task(void)
         uint32_t id = msg->id;
         if (CanData.assigned_id && id == CanData.assigned_id + 1)
             can_id_conflict();
-        else if (id == CANBUS_ID_ADMIN)
+        else if (id == CANBUS_ID_ADMIN) {
             can_process_admin(msg);
-        CanData.admin_pull_pos = pullp + 1;
+            if (msg->dlc && msg->data[0] == CANBUS_CMD_QUERY_UNASSIGNED)
+                writeb(&CanData.query_queued, 0);
+        }
+        /*
+         * Return this slot only after task-side processing no longer uses it.
+         */
+        writel(&CanData.admin_pull_pos, pullp + 1);
     }
 
-    // Check for a complete message block and process it
-    uint_fast8_t rpos = readb(&CanData.receive_pos), pop_count;
-    int ret = command_find_block(CanData.receive_buf, rpos, &pop_count);
-    if (ret > 0)
-        command_dispatch(CanData.receive_buf, pop_count);
-    if (ret) {
+    /*
+     * A Klipper command block commonly spans several eight-byte CAN frames,
+     * and a SocketCAN sender can place several complete blocks on the bus in
+     * one scheduling interval.  Processing only the first block made every
+     * already-buffered successor wait for another scheduler pass.
+     *
+     * Dispatch a bounded group in one task invocation.  Remove each block
+     * before invoking the next command so the interrupt regains receive-buffer
+     * capacity promptly; console_pop_input() retains its interrupt-protected
+     * retry if a CAN frame arrives during compaction.  The task itself now owns
+     * the decision to continue, so compaction no longer schedules a redundant
+     * future pass merely because bytes remain.  Acknowledgements remain per
+     * protocol block and in sequence.  Bound the group so command input can not
+     * monopolize a cooperative scheduler pass when other MCU tasks are ready.
+     */
+    uint_fast8_t command_count;
+    for (command_count = 0; command_count < CAN_RX_COMMAND_BATCH;
+         command_count++) {
+        uint_fast8_t rpos = readb(&CanData.receive_pos), pop_count;
+        int ret = command_find_block(CanData.receive_buf, rpos, &pop_count);
+        if (!ret)
+            break;
+        if (ret > 0)
+            command_dispatch(CanData.receive_buf, pop_count);
         console_pop_input(pop_count);
         if (ret > 0)
             command_send_ack();
     }
+    if (command_count == CAN_RX_COMMAND_BATCH
+        && readb(&CanData.receive_pos))
+        canserial_notify_rx();
 }
 DECL_TASK(canserial_rx_task);
 
@@ -340,6 +527,30 @@ DECL_COMMAND_FLAGS(command_get_canbus_status, HF_IN_SHUTDOWN
                    , "get_canbus_status");
 
 void
+command_get_canbus_diagnostics(uint32_t *args)
+{
+    struct canbus_diagnostics diag;
+    memset(&diag, 0, sizeof(diag));
+    canbus_get_diagnostics(&diag);
+    /*
+     * Hardware, the CAN-to-USB bridge, and canserial each own different queue
+     * boundaries.  Aggregate their monotonically wrapping counters only when
+     * queried, keeping every receive fast path to one local increment while
+     * giving the host a single stable view of frames which could not advance.
+     * This is a separate optional command rather than extending canbus_status:
+     * older hosts continue matching that established response format exactly.
+     */
+    diag.rx_overflows += (readl(&CanData.receive_overflows)
+                          + readl(&CanData.admin_overflows));
+    sendf("canbus_diagnostics rx_overflows=%u tx_discards=%u"
+          " usb_invalid=%u bus_off=%u"
+          , diag.rx_overflows, diag.tx_discards
+          , diag.usb_invalid, diag.bus_off);
+}
+DECL_COMMAND_FLAGS(command_get_canbus_diagnostics, HF_IN_SHUTDOWN
+                   , "get_canbus_diagnostics");
+
+void
 command_get_canbus_id(uint32_t *args)
 {
     sendf("canbus_id canbus_uuid=%.*s canbus_nodeid=%u"
@@ -358,6 +569,14 @@ canserial_set_uuid(uint8_t *raw_uuid, uint32_t raw_uuid_len)
 void
 canserial_shutdown(void)
 {
+    /*
+     * Shutdown removes scheduler timers before running shutdown callbacks, so
+     * a CQS_WAITING response can no longer become ready.  Reset the logical
+     * ownership as well as relying on timer removal: shutdown still wakes the
+     * transmit task, and leaving READY set could emit a stale discovery frame
+     * while the MCU is reporting its shutdown state.
+     */
+    CanData.query_state = CQS_IDLE;
     canserial_notify_tx();
     canserial_notify_rx();
 }

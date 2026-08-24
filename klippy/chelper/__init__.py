@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging
+import os, logging, shlex, subprocess
 import cffi
 
 
@@ -97,6 +97,14 @@ defs_trapq = """
         double x_r, y_r, z_r;
     };
 
+    struct trapq_append_move {
+        double print_time;
+        double accel_t, cruise_t, decel_t;
+        double start_pos_x, start_pos_y, start_pos_z;
+        double axes_r_x, axes_r_y, axes_r_z;
+        double start_v, cruise_v, accel;
+    };
+
     struct trapq *trapq_alloc(void);
     void trapq_free(struct trapq *tq);
     void trapq_append(struct trapq *tq, double print_time
@@ -104,6 +112,8 @@ defs_trapq = """
         , double start_pos_x, double start_pos_y, double start_pos_z
         , double axes_r_x, double axes_r_y, double axes_r_z
         , double start_v, double cruise_v, double accel);
+    void trapq_append_batch(struct trapq *tq
+        , const struct trapq_append_move *moves, int move_count);
     void trapq_finalize_moves(struct trapq *tq, double print_time
         , double clear_history_time);
     void trapq_set_position(struct trapq *tq, double print_time
@@ -204,7 +214,7 @@ defs_serialqueue = """
     void serialqueue_set_receive_window(struct serialqueue *sq
         , int receive_window);
     void serialqueue_set_clock_est(struct serialqueue *sq, double est_freq
-        , double conv_time, uint64_t conv_clock, uint64_t last_clock);
+        , double conv_time, uint64_t conv_clock);
     void serialqueue_get_stats(struct serialqueue *sq, char *buf, int len);
     int serialqueue_extract_old(struct serialqueue *sq, int sentq
         , struct pull_queue_message *q, int max);
@@ -265,14 +275,17 @@ def check_build_code(sources, target):
 
 # Check if the current gcc version supports a particular command-line option
 def check_gcc_option(option):
-    cmd = "%s %s -S -o /dev/null -xc /dev/null > /dev/null 2>&1" % (
-        GCC_CMD, option)
-    res = os.system(cmd)
+    cmd = [GCC_CMD] + shlex.split(option) + [
+        '-S', '-o', os.devnull, '-xc', os.devnull]
+    with open(os.devnull, 'wb') as devnull:
+        res = subprocess.call(cmd, stdout=devnull, stderr=devnull)
     return res == 0
 
-# Check if the current gcc version supports a particular command-line option
+# Run a compiler command without invoking a shell
 def do_build_code(cmd):
-    res = os.system(cmd)
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+    res = subprocess.call(cmd)
     if res:
         msg = "Unable to build C code module (error=%s)" % (res,)
         logging.error(msg)
@@ -287,15 +300,13 @@ def check_build_c_library():
     if not check_build_code(srcfiles+ofiles+[__file__], destlib):
         # Code already built
         return destlib
-    # Select command line options
-    if check_gcc_option(SSE_FLAGS):
-        cmd = "%s %s %s" % (GCC_CMD, SSE_FLAGS, COMPILE_ARGS)
-    else:
-        cmd = "%s %s" % (GCC_CMD, COMPILE_ARGS)
     # Invoke compiler
     logging.info("Building C code module %s", DEST_LIB)
     tempdestlib = get_abs_files(srcdir, ["_temp_" + DEST_LIB])[0]
-    do_build_code(cmd % (tempdestlib, ' '.join(srcfiles)))
+    compile_flags = shlex.split(COMPILE_ARGS % (tempdestlib, ''))
+    if check_gcc_option(SSE_FLAGS):
+        compile_flags = shlex.split(SSE_FLAGS) + compile_flags
+    do_build_code([GCC_CMD] + compile_flags + srcfiles)
     # Rename from temporary file to final file name
     os.rename(tempdestlib, destlib)
     return destlib
@@ -316,8 +327,7 @@ def get_ffi():
         destlib = check_build_c_library()
         # Open library
         FFI_main = cffi.FFI()
-        for d in defs_all:
-            FFI_main.cdef(d)
+        FFI_main.cdef('\n'.join(defs_all))
         FFI_lib = FFI_main.dlopen(destlib)
         # Setup error logging
         pyhelper_logging_callback = FFI_main.callback("void func(const char *)",
@@ -330,11 +340,9 @@ def get_ffi():
 # hub-ctrl hub power controller
 ######################################################################
 
-HC_COMPILE_CMD = "gcc -Wall -g -O2 -o %s %s -lusb"
 HC_SOURCE_FILES = ['hub-ctrl.c']
 HC_SOURCE_DIR = '../../lib/hub-ctrl'
 HC_TARGET = "hub-ctrl"
-HC_CMD = "sudo %s/hub-ctrl -h 0 -P 2 -p %d"
 
 def run_hub_ctrl(enable_power):
     srcdir = os.path.dirname(os.path.realpath(__file__))
@@ -343,8 +351,10 @@ def run_hub_ctrl(enable_power):
     destlib = get_abs_files(hubdir, [HC_TARGET])[0]
     if check_build_code(srcfiles, destlib):
         logging.info("Building C code module %s", HC_TARGET)
-        do_build_code(HC_COMPILE_CMD % (destlib, ' '.join(srcfiles)))
-    os.system(HC_CMD % (hubdir, enable_power))
+        do_build_code([GCC_CMD, '-Wall', '-g', '-O2', '-o', destlib]
+                      + srcfiles + ['-lusb'])
+    subprocess.call(['sudo', destlib, '-h', '0', '-P', '2',
+                     '-p', str(enable_power)])
 
 
 if __name__ == '__main__':

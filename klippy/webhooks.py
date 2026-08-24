@@ -3,7 +3,7 @@
 # Copyright (C) 2020 Eric Callahan <arksine.code@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license
-import logging, socket, os, sys, errno, collections
+import logging, socket, os, sys, errno, collections, stat, math
 import gcode
 
 try:
@@ -36,7 +36,16 @@ else:
     json_dumps = msgspec.json.encode
     json_loads = msgspec.json.decode
 
+# Bounds on resources controlled by API clients
 REQUEST_LOG_SIZE = 20
+MAX_REQUEST_SIZE = 1024 * 1024
+MAX_REQUEST_LOG_ENTRY = 16 * 1024
+MAX_SEND_BUFFER_SIZE = 8 * 1024 * 1024
+MAX_CLIENT_CONNECTIONS = 64
+MAX_REQUESTS_PER_READ = 128
+MAX_REMOTE_METHOD_LENGTH = 256
+MAX_REMOTE_TEMPLATE_SIZE = 64 * 1024
+MAX_REMOTE_METHODS_PER_CLIENT = 64
 
 class WebRequestError(gcode.CommandError):
     def __init__(self, message,):
@@ -84,7 +93,10 @@ class WebRequest:
         return self.get(item, default, types=(int,))
 
     def get_float(self, item, default=Sentinel):
-        return float(self.get(item, default, types=(int, float)))
+        value = float(self.get(item, default, types=(int, float)))
+        if math.isnan(value) or math.isinf(value):
+            raise WebRequestError("Invalid Argument Value [%s]" % (item,))
+        return value
 
     def get_dict(self, item, default=Sentinel):
         return self.get(item, default, types=(dict,))
@@ -130,6 +142,7 @@ class ServerSocket:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.setblocking(0)
         self.sock.bind(server_address)
+        os.chmod(server_address, 0o660)
         self.sock.listen(1)
         self.fd_handle = self.reactor.register_fd(
             self.sock.fileno(), self._handle_accept)
@@ -142,6 +155,10 @@ class ServerSocket:
         try:
             sock, addr = self.sock.accept()
         except socket.error:
+            return
+        if len(self.clients) >= MAX_CLIENT_CONNECTIONS:
+            logging.warning("webhooks: Rejecting excess client connection")
+            sock.close()
             return
         sock.setblocking(0)
         client = ClientConnection(self, sock)
@@ -163,13 +180,16 @@ class ServerSocket:
 
     def _remove_socket_file(self, file_path):
         try:
-            os.remove(file_path)
-        except OSError:
-            if os.path.exists(file_path):
-                logging.exception(
-                    "webhooks: Unable to delete socket file '%s'"
-                    % (file_path))
-                raise
+            path_stat = os.lstat(file_path)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                return
+            raise
+        if (not stat.S_ISSOCK(path_stat.st_mode)
+            or path_stat.st_uid != os.geteuid()):
+            raise RuntimeError(
+                "Refusing to delete unsafe API path '%s'" % (file_path,))
+        os.remove(file_path)
 
     def pop_client(self, client_id):
         self.clients.pop(client_id, None)
@@ -209,14 +229,15 @@ class ClientConnection:
         logging.info("\n".join(out))
 
     def set_client_info(self, client_info, state_msg=None):
+        client_repr = repr(client_info)[:MAX_REQUEST_LOG_ENTRY]
         if state_msg is None:
-            state_msg = "Client info %s" % (repr(client_info),)
+            state_msg = "Client info %s" % (client_repr,)
         logging.info("webhooks client %s: %s", self.uid, state_msg)
         log_id = "webhooks %s" % (self.uid,)
         if client_info is None:
             self.printer.set_rollover_info(log_id, None, log=False)
             return
-        rollover_msg = "webhooks client %s: %s" % (self.uid, repr(client_info))
+        rollover_msg = "webhooks client %s: %s" % (self.uid, client_repr)
         self.printer.set_rollover_info(log_id, rollover_msg, log=False)
 
     def close(self):
@@ -229,6 +250,7 @@ class ClientConnection:
             self.sock.close()
         except socket.error:
             pass
+        self.webhooks.remove_client(self)
         self.server.pop_client(self.uid)
 
     def is_closed(self):
@@ -251,14 +273,33 @@ class ClientConnection:
         requests = data.split(b'\x03')
         requests[0] = self.partial_data + requests[0]
         self.partial_data = requests.pop()
+        if len(requests) > MAX_REQUESTS_PER_READ:
+            logging.warning("webhooks: Closing client %s with excessive "
+                            "request rate", self.uid)
+            self.close()
+            return
+        if self.partial_data and len(self.partial_data) > MAX_REQUEST_SIZE:
+            logging.warning("webhooks: Closing client %s with overlong request",
+                            self.uid)
+            self.close()
+            return
         for req in requests:
-            self.request_log.append((eventtime, req))
+            if not req:
+                continue
+            if len(req) > MAX_REQUEST_SIZE:
+                logging.warning(
+                    "webhooks: Closing client %s with overlong request",
+                    self.uid)
+                self.close()
+                return
+            self.request_log.append((eventtime, req[:MAX_REQUEST_LOG_ENTRY]))
             try:
                 web_request = WebRequest(self, req)
             except Exception:
-                logging.exception("webhooks: Error decoding Server Request %s"
-                                  % (req))
-                continue
+                logging.exception("webhooks: Error decoding Server Request "
+                                  "%s", req[:MAX_REQUEST_LOG_ENTRY])
+                self.close()
+                return
             self.reactor.register_callback(
                 lambda e, s=self, wr=web_request: s._process_request(wr))
 
@@ -282,6 +323,13 @@ class ClientConnection:
     def send(self, data):
         try:
             jmsg = json_dumps(data)
+            if (len(jmsg) > MAX_SEND_BUFFER_SIZE
+                or len(self.send_buffer) + len(jmsg) + 1
+                   > MAX_SEND_BUFFER_SIZE):
+                logging.warning("webhooks: Closing client %s with excessive "
+                                "response data", self.uid)
+                self.close()
+                return
             self.send_buffer += jmsg + b"\x03"
         except (TypeError, ValueError) as e:
             msg = ("json encoding error: %s" % (str(e),))
@@ -386,9 +434,22 @@ class WebHooks:
         template = web_request.get_dict('response_template')
         method = web_request.get_str('remote_method')
         new_conn = web_request.get_client_connection()
+        registered_count = sum(
+            new_conn in conn_map for conn_map in self._remote_methods.values())
+        if (not method or len(method) > MAX_REMOTE_METHOD_LENGTH
+            or len(json_dumps(template)) > MAX_REMOTE_TEMPLATE_SIZE
+            or (new_conn not in self._remote_methods.get(method, {})
+                and registered_count >= MAX_REMOTE_METHODS_PER_CLIENT)):
+            raise WebRequestError("Invalid remote method registration")
         logging.info("webhooks: registering remote method '%s' "
                      "for connection id: %d" % (method, id(new_conn)))
         self._remote_methods.setdefault(method, {})[new_conn] = template
+
+    def remove_client(self, connection):
+        for method, conn_map in list(self._remote_methods.items()):
+            conn_map.pop(connection, None)
+            if not conn_map:
+                del self._remote_methods[method]
 
     def get_connection(self):
         return self.sconn
@@ -414,14 +475,15 @@ class WebHooks:
                 "Remote method '%s' not registered" % (method))
         conn_map = self._remote_methods[method]
         valid_conns = {}
-        for conn, template in conn_map.items():
+        for conn, template in list(conn_map.items()):
             if not conn.is_closed():
-                valid_conns[conn] = template
                 out = {'params': kwargs}
                 out.update(template)
                 conn.send(out)
+                if not conn.is_closed():
+                    valid_conns[conn] = template
         if not valid_conns:
-            del self._remote_methods[method]
+            self._remote_methods.pop(method, None)
             raise self.printer.command_error(
                 "No active connections for method '%s'" % (method))
         self._remote_methods[method] = valid_conns

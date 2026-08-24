@@ -172,7 +172,7 @@ class PrinterExtruder:
         # Setup extruder trapq (trapezoidal motion queue)
         self.motion_queuing = self.printer.load_object(config, 'motion_queuing')
         self.trapq = self.motion_queuing.allocate_trapq()
-        self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        self.trapq_append_moves = self.motion_queuing.append_trapq_moves
         # Setup extruder stepper
         self.extruder_stepper = None
         if (config.get('step_pin', None) is not None
@@ -239,20 +239,33 @@ class PrinterExtruder:
             return (self.instant_corner_v / abs(diff_r))**2
         return move.max_cruise_v2
     def process_move(self, print_time, move, ea_index):
-        axis_r = move.axes_r[ea_index]
-        accel = move.accel * axis_r
-        start_v = move.start_v * axis_r
-        cruise_v = move.cruise_v * axis_r
-        can_pressure_advance = False
-        if axis_r > 0. and (move.axes_d[0] or move.axes_d[1]):
-            can_pressure_advance = True
-        # Queue movement (x is extruder movement, y is pressure advance flag)
-        self.trapq_append(self.trapq, print_time,
-                          move.accel_t, move.cruise_t, move.decel_t,
-                          move.start_pos[ea_index], 0., 0.,
-                          1., can_pressure_advance, 0.,
-                          start_v, cruise_v, accel)
-        self.last_position = move.end_pos[ea_index]
+        # Retain the established single-move entry point for callers outside
+        # ToolHead; the normal lookahead path discovers process_moves() and
+        # submits a bounded group instead.
+        self.process_moves(((print_time, move, ea_index),))
+    def process_moves(self, moves):
+        if not moves:
+            return
+        trapq_moves = []
+        last_move = last_ea_index = None
+        for print_time, move, ea_index in moves:
+            axis_r = move.axes_r[ea_index]
+            accel = move.accel * axis_r
+            start_v = move.start_v * axis_r
+            cruise_v = move.cruise_v * axis_r
+            can_pressure_advance = False
+            if axis_r > 0. and (move.axes_d[0] or move.axes_d[1]):
+                can_pressure_advance = True
+            # Queue movement (x is extrusion, y enables pressure advance).
+            trapq_moves.append((
+                print_time,
+                move.accel_t, move.cruise_t, move.decel_t,
+                move.start_pos[ea_index], 0., 0.,
+                1., can_pressure_advance, 0.,
+                start_v, cruise_v, accel))
+            last_move, last_ea_index = move, ea_index
+        self.trapq_append_moves(self.trapq, trapq_moves)
+        self.last_position = last_move.end_pos[last_ea_index]
     def find_past_position(self, print_time):
         if self.extruder_stepper is None:
             return 0.

@@ -50,10 +50,30 @@ class SerialReader:
             if response.notify_id:
                 params = {'#sent_time': response.sent_time,
                           '#receive_time': response.receive_time}
-                completion = self.pending_notifications.pop(response.notify_id)
+                # Notification ids are allocated by this host and returned by
+                # serialqueue when the corresponding message is acknowledged;
+                # they are not MCU-controlled dictionary values.  Even so, a
+                # duplicate or stale completion must not raise KeyError out of
+                # this function: _bg_thread is the sole receiver for all later
+                # MCU traffic, so losing it would turn one bookkeeping
+                # inconsistency into a silent, permanent connection stall.
+                # Report the violated invariant and discard only the orphaned
+                # completion, matching the containment used for an invalid MCU
+                # message below.
+                completion = self.pending_notifications.pop(
+                    response.notify_id, None)
+                if completion is None:
+                    logging.error("%sUnknown serial notification id %d",
+                                  self.warn_prefix, response.notify_id)
+                    continue
                 self.reactor.async_complete(completion, params)
                 continue
-            params = self.msgparser.parse(response.msg[0:count])
+            try:
+                params = self.msgparser.parse(response.msg[0:count])
+            except Exception:
+                logging.exception("%sInvalid message from MCU",
+                                  self.warn_prefix)
+                continue
             params['#sent_time'] = response.sent_time
             params['#receive_time'] = response.receive_time
             hdl = (params['#name'], params.get('oid'))
@@ -68,21 +88,31 @@ class SerialReader:
         raise error(self.warn_prefix + (msg % params))
     def _get_identify_data(self, eventtime):
         # Query the "data dictionary" from the micro-controller
-        identify_data = b""
+        # Keep chunks separate to avoid quadratic copying of MCU supplied data
+        identify_chunks = []
+        identify_size = 0
         while 1:
-            msg = "identify offset=%d count=%d" % (len(identify_data), 40)
+            msg = "identify offset=%d count=%d" % (identify_size, 40)
             try:
                 params = self.send_with_response(msg, 'identify_response')
             except error as e:
                 logging.exception("%sWait for identify_response",
                                   self.warn_prefix)
                 return None
-            if params['offset'] == len(identify_data):
-                msgdata = params['data']
-                if not msgdata:
-                    # Done
-                    return identify_data
-                identify_data += msgdata
+            if params['offset'] != identify_size:
+                logging.error("%sMCU identify response has invalid offset",
+                              self.warn_prefix)
+                return None
+            msgdata = params['data']
+            if not msgdata:
+                # Done
+                return b''.join(identify_chunks)
+            if identify_size + len(msgdata) > msgproto.MAX_IDENTIFY_SIZE:
+                logging.error("%sMCU identify data exceeds maximum size",
+                              self.warn_prefix)
+                return None
+            identify_chunks.append(msgdata)
+            identify_size += len(msgdata)
     def _start_session(self, serial_dev, serial_fd_type=b'u', client_id=0):
         self.serial_dev = serial_dev
         self.serialqueue = self.ffi_main.gc(
@@ -118,8 +148,31 @@ class SerialReader:
         return True
     def connect_canbus(self, canbus_uuid, canbus_nodeid, canbus_iface="can0"):
         import can # XXX
+        # Most callers obtain a checked id from canbus_ids, but console and
+        # diagnostic users can reach this transport entry point directly.  The
+        # assignment command has only one payload byte for the node id, and the
+        # corresponding standard CAN ids are calculated from the same range.
+        # Validate before either representation is built so an invalid caller
+        # receives a normal Klipper connection error instead of an incidental
+        # python-can packing or arbitration-id exception.
+        if canbus_nodeid < 0 or canbus_nodeid > 0xff:
+            self._error("Invalid CAN nodeid")
         txid = canbus_nodeid * 2 + 256
-        filters = [{"can_id": txid+1, "can_mask": 0x7ff, "extended": False}]
+        # python-can adds CAN_EFF_FLAG to the kernel mask when "extended" is
+        # present, but a bare 11-bit mask still permits a remote-transmission
+        # request with the same identifier.  serialqueue would discard that
+        # frame after waking its poll thread, and Linux would place this socket
+        # on a general receive-filter list.  Include CAN_RTR_FLAG in the mask so
+        # the subscription describes exactly one standard data-frame id.  In
+        # addition to rejecting the unused frame type in the kernel, this is
+        # the mask shape SocketCAN uses for its direct-indexed standard-id
+        # receive table.  That distinction matters here because Klipper opens
+        # one filtered raw socket per CAN MCU; a general-list lookup otherwise
+        # grows with the number of configured nodes on every received frame.
+        CAN_RTR_FLAG = 0x40000000
+        filters = [{"can_id": txid+1,
+                    "can_mask": 0x7ff | CAN_RTR_FLAG,
+                    "extended": False}]
         # Prep for SET_NODEID command
         try:
             uuid = int(canbus_uuid, 16)
@@ -139,13 +192,42 @@ class SerialReader:
         while 1:
             if self.reactor.monotonic() > start_time + 90.:
                 self._error("Unable to connect")
+            bus = None
             try:
                 bus = can.interface.Bus(channel=canbus_iface,
                                         can_filters=filters,
                                         bustype='socketcan')
-                bus.send(set_id_msg)
+                # python-can defines a missing timeout as permission to block
+                # indefinitely while the local transmit queue is unavailable.
+                # That would run in the reactor thread and prevent both the
+                # surrounding 90-second connection deadline and every other
+                # reactor callback from making progress.  Bound only this
+                # individual queue attempt; a timeout raises CanError and uses
+                # the existing cleanup, pause, and retry path.  One second is
+                # deliberately much longer than normal SocketCAN queue latency
+                # while still keeping a wedged interface subordinate to
+                # Klipper's connection deadline.
+                bus.send(set_id_msg, timeout=1.0)
             except (can.CanError, os.error, IOError) as e:
-                logging.warning("%sUnable to open CAN port: %s",
+                if bus is not None:
+                    # Socket construction and the first assignment send share
+                    # one retry block, but they do not share resource
+                    # ownership.  Once construction succeeds, bus owns a raw
+                    # SocketCAN socket and the receive filters installed for
+                    # it, even if the first frame can not be queued.  Leaving
+                    # that partially initialized object open is especially
+                    # costly here: the retry loop may run for 90 seconds and
+                    # would create another socket and filter set on every
+                    # attempt.  Test the acquisition state explicitly and
+                    # release it before pausing.  Cleanup is best-effort and
+                    # logged separately so a shutdown error can not replace
+                    # the CAN access error which caused this retry.
+                    try:
+                        bus.shutdown()
+                    except Exception:
+                        logging.exception("%sUnable to close CAN port",
+                                          self.warn_prefix)
+                logging.warning("%sUnable to access CAN port: %s",
                                 self.warn_prefix, e)
                 self.reactor.pause(self.reactor.monotonic() + 5.)
                 continue
@@ -211,9 +293,9 @@ class SerialReader:
             self.ffi_lib.serialqueue_alloc(self.serial_dev.fileno(), b'f', 0,
                                            self.sq_name),
             self.ffi_lib.serialqueue_free)
-    def set_clock_est(self, freq, conv_time, conv_clock, last_clock):
+    def set_clock_est(self, freq, conv_time, conv_clock):
         self.ffi_lib.serialqueue_set_clock_est(
-            self.serialqueue, freq, conv_time, conv_clock, last_clock)
+            self.serialqueue, freq, conv_time, conv_clock)
     def disconnect(self):
         if self.serialqueue is not None:
             self.ffi_lib.serialqueue_exit(self.serialqueue)
@@ -249,9 +331,13 @@ class SerialReader:
                 self.handlers[name, oid] = callback
     # Command sending
     def raw_send(self, cmd, minclock, reqclock, cmd_queue):
+        if len(cmd) > msgproto.MESSAGE_PAYLOAD_MAX:
+            self._error("Serial message exceeds maximum length")
         self.ffi_lib.serialqueue_send(self.serialqueue, cmd_queue,
                                       cmd, len(cmd), minclock, reqclock, 0)
     def raw_send_wait_ack(self, cmd, minclock, reqclock, cmd_queue):
+        if len(cmd) > msgproto.MESSAGE_PAYLOAD_MAX:
+            self._error("Serial message exceeds maximum length")
         self.last_notify_id += 1
         nid = self.last_notify_id
         completion = self.reactor.completion()
@@ -274,6 +360,8 @@ class SerialReader:
                                 self.ffi_lib.serialqueue_free_commandqueue)
     # Dumping debug lists
     def dump_debug(self):
+        if self.serialqueue is None:
+            return ""
         out = []
         out.append("Dumping serial stats: %s" % (
             self.stats(self.reactor.monotonic()),))
@@ -287,13 +375,13 @@ class SerialReader:
         for i in range(scount):
             msg = sdata[i]
             cmds = self.msgparser.dump(msg.msg[0:msg.len])
-            out.append("Sent %d %f %f %d: %s" % (
+            out.append("Sent %02d %f %f %02d: %s" % (
                 i, msg.receive_time, msg.sent_time, msg.len, ', '.join(cmds)))
         out.append("Dumping receive queue %d messages" % (rcount,))
         for i in range(rcount):
             msg = rdata[i]
             cmds = self.msgparser.dump(msg.msg[0:msg.len])
-            out.append("Receive: %d %f %f %d: %s" % (
+            out.append("Receive: %02d %f %f %02d: %s" % (
                 i, msg.receive_time, msg.sent_time, msg.len, ', '.join(cmds)))
         return '\n'.join(out)
     # Default message handlers

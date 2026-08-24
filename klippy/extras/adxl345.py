@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, time, collections, multiprocessing, os
+import util
 from . import bus, bulk_sensor
 
 # ADXL345 registers
@@ -92,7 +93,7 @@ class AccelQueryHelper:
                 os.nice(20)
             except:
                 pass
-            f = open(filename, "w")
+            f = util.open_file_for_write(filename)
             f.write("#time,accel_x,accel_y,accel_z\n")
             samples = self.samples or self.get_samples()
             for t, accel_x, accel_y, accel_z in samples:

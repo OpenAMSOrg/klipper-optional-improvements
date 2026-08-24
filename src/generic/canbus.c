@@ -4,6 +4,7 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include <string.h> // memset
 #include "autoconf.h" // CONFIG_CANBUS_FREQUENCY
 #include "canbus.h" // canhw_send
 #include "canserial.h" // canserial_notify_tx
@@ -32,5 +33,16 @@ canbus_notify_tx(void)
 void
 canbus_process_data(struct canbus_msg *msg)
 {
+    canbus_normalize_msg(msg);
     canserial_process_data(msg);
+}
+
+void
+canbus_get_diagnostics(struct canbus_diagnostics *diag)
+{
+    struct canbus_status status;
+    memset(&status, 0, sizeof(status));
+    canhw_get_status(&status);
+    diag->rx_overflows = status.rx_overflows;
+    diag->bus_off = status.bus_off;
 }

@@ -49,7 +49,10 @@ def _parse_axis(gcmd, raw_axis):
         dir_x = float(dirs[0].strip())
         dir_y = float(dirs[1].strip())
         dir_z = float(dirs[2].strip()) if len(dirs) == 3 else 0.
-    except:
+        if any(math.isnan(d) or math.isinf(d)
+               for d in (dir_x, dir_y, dir_z)):
+            raise ValueError
+    except ValueError:
         raise gcmd.error(
                 "Unable to parse axis direction '%s'" % (raw_axis,))
     return TestAxis(vib_dir=(dir_x, dir_y, dir_z))
@@ -243,7 +246,8 @@ class ResonanceTestExecutor:
             last_v = v
             last_freq = freq
         if last_v:
-            d_decel = -.5 * last_v2 / old_max_accel
+            # Decelerate to a stop, continuing in the direction of motion
+            d_decel = .5 * last_v * abs(last_v) / old_max_accel
             decel_X, decel_Y, decel_Z = axis.get_point(d_decel)
             toolhead.set_max_velocities(None, old_max_accel, None, None)
             toolhead.move([X + decel_X, Y + decel_Y, Z + decel_Z] + tpos[3:],
@@ -405,6 +409,8 @@ class ResonanceTester:
                 raise gcmd.error("Invalid POINT parameter, must be 'x,y,z'")
             try:
                 test_point = [float(p.strip()) for p in test_coords]
+                if any(math.isnan(p) or math.isinf(p) for p in test_point):
+                    raise ValueError
             except ValueError:
                 raise gcmd.error("Invalid POINT parameter, must be 'x,y,z'"
                 " where x, y and z are valid floating point numbers")
@@ -505,7 +511,7 @@ class ResonanceTester:
     cmd_MEASURE_AXES_NOISE_help = (
         "Measures noise of all enabled accelerometer chips")
     def cmd_MEASURE_AXES_NOISE(self, gcmd):
-        meas_time = gcmd.get_float("MEAS_TIME", 2.)
+        meas_time = gcmd.get_float("MEAS_TIME", 2., above=0.)
         raw_values = [(chip_axis, chip.start_internal_client())
                       for chip_axis, chip in self.accel_chips]
         self.printer.lookup_object('toolhead').dwell(meas_time)

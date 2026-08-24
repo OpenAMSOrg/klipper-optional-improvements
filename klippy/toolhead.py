@@ -6,6 +6,13 @@
 import math, logging, importlib
 import mcu, chelper, kinematics.extruder
 
+# math.isfinite() is unavailable on Python 2.
+try:
+    isfinite = math.isfinite
+except AttributeError:
+    def isfinite(value):
+        return not (math.isnan(value) or math.isinf(value))
+
 # Common suffixes: _d is distance (in mm), _v is velocity (in
 #   mm/second), _v2 is velocity squared (mm^2/s^2), _t is time (in
 #   seconds), _r is ratio (scalar between 0.0 and 1.0)
@@ -22,7 +29,9 @@ class Move:
         velocity = min(speed, toolhead.max_velocity)
         self.is_kinematic_move = True
         self.axes_d = axes_d = [ep - sp for sp, ep in zip(start_pos, end_pos)]
-        self.move_d = move_d = math.sqrt(sum([d*d for d in axes_d[:3]]))
+        self.move_d = move_d = math.sqrt(
+            axes_d[0] * axes_d[0] + axes_d[1] * axes_d[1]
+            + axes_d[2] * axes_d[2])
         if move_d < .000000001:
             # Extrude only move
             self.end_pos = ((start_pos[0], start_pos[1], start_pos[2])
@@ -43,14 +52,14 @@ class Move:
         # delta_v2 is the maximum amount of this squared-velocity that
         # can change in this move.
         self.max_start_v2 = 0.
-        self.max_cruise_v2 = velocity**2
+        self.max_cruise_v2 = velocity * velocity
         self.delta_v2 = 2.0 * move_d * self.accel
         self.next_junction_v2 = 999999999.9
         # Setup for minimum_cruise_ratio checks
         self.max_mcr_start_v2 = 0.
         self.mcr_delta_v2 = 2.0 * move_d * toolhead.mcr_pseudo_accel
     def limit_speed(self, speed, accel):
-        speed2 = speed**2
+        speed2 = speed * speed
         if speed2 < self.max_cruise_v2:
             self.max_cruise_v2 = speed2
             self.min_move_t = self.move_d / speed
@@ -58,7 +67,7 @@ class Move:
         self.delta_v2 = 2.0 * self.move_d * self.accel
         self.mcr_delta_v2 = min(self.mcr_delta_v2, self.delta_v2)
     def limit_next_junction_speed(self, speed):
-        self.next_junction_v2 = min(self.next_junction_v2, speed**2)
+        self.next_junction_v2 = min(self.next_junction_v2, speed * speed)
     def move_error(self, msg="Move out of range"):
         ep = self.end_pos
         m = "%s: %.3f %.3f %.3f [%.3f]" % (msg, ep[0], ep[1], ep[2], ep[3])
@@ -66,13 +75,19 @@ class Move:
     def calc_junction(self, prev_move):
         if not self.is_kinematic_move or not prev_move.is_kinematic_move:
             return
-        # Allow extra axes to calculate maximum junction
-        ea_v2 = [ea.calc_junction(prev_move, self, e_index+3)
-                 for e_index, ea in enumerate(self.toolhead.extra_axes)]
-        max_start_v2 = min([self.max_cruise_v2,
-                            prev_move.max_cruise_v2, prev_move.next_junction_v2,
-                            prev_move.max_start_v2 + prev_move.delta_v2]
-                           + ea_v2)
+        # Establish the kinematic limits as one scalar, then fold each extra
+        # axis into it as that axis calculates its own junction constraint.
+        # Building ea_v2 followed by a second concatenated list allocated two
+        # temporary containers for every move, even though min() consumes each
+        # value once and retains only the smallest.  The incremental minimum
+        # preserves the same axis order and result while keeping the common
+        # CoreXY-plus-extruder junction path free of those list allocations.
+        max_start_v2 = min(self.max_cruise_v2, prev_move.max_cruise_v2,
+                           prev_move.next_junction_v2,
+                           prev_move.max_start_v2 + prev_move.delta_v2)
+        for e_index, ea in enumerate(self.toolhead.extra_axes):
+            max_start_v2 = min(
+                max_start_v2, ea.calc_junction(prev_move, self, e_index+3))
         # Find max velocity using "approximated centripetal velocity"
         axes_r = self.axes_r
         prev_axes_r = prev_move.axes_r
@@ -180,6 +195,18 @@ class LookAheadQueue:
                               , min(next_start_v2, cruise_v2))
             prev_cruise_v2 = cruise_v2
         # Remove processed moves from the queue
+        if flush_count == len(queue):
+            # A normal non-lazy flush transfers ownership of every queued move
+            # to _process_lookahead().  Slicing the complete list and then
+            # deleting the same references from the original performs two
+            # linear copies and reference-count updates merely to preserve the
+            # identity of an internal list which no caller can access.  Hand
+            # the populated list directly to the consumer and install a fresh
+            # empty queue for later submissions.  The lazy partial-flush case
+            # below must still retain its unprocessed suffix, so it deliberately
+            # keeps the established slice-and-delete behavior.
+            self.queue = []
+            return queue
         res = queue[:flush_count]
         del queue[:flush_count]
         return res
@@ -195,6 +222,7 @@ class LookAheadQueue:
 BUFFER_TIME_HIGH = 1.0
 BUFFER_TIME_START = 0.250
 PRIMING_CMD_TIME = 0.100
+TRAPQ_BATCH_SIZE = 64
 
 # Main code to track events (and their timing) on the printer toolhead
 class ToolHead:
@@ -232,6 +260,7 @@ class ToolHead:
                                                     can_add_trapq=True)
         self.trapq = self.motion_queuing.allocate_trapq()
         self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        self.trapq_append_moves = self.motion_queuing.append_trapq_moves
         # Create kinematics class
         gcode = self.printer.lookup_object('gcode')
         self.Coord = gcode.Coord
@@ -266,6 +295,17 @@ class ToolHead:
             self.print_time = min_print_time
             self.printer.send_event("toolhead:sync_print_time",
                                     curtime, est_print_time, self.print_time)
+    def _flush_trapq_batches(self, trapq_moves, extra_axis_batches):
+        # Submit every queue through the current move before a timing callback
+        # can inspect motion state.  Each native helper consumes its temporary
+        # array synchronously, so the Python lists may be emptied and reused
+        # without retaining foreign-owned storage between batches.
+        self.trapq_append_moves(self.trapq, trapq_moves)
+        del trapq_moves[:]
+        for _, process_moves, axis_moves in extra_axis_batches:
+            if axis_moves:
+                process_moves(axis_moves)
+                del axis_moves[:]
     def _process_lookahead(self, lazy=False):
         moves = self.lookahead.flush(lazy=lazy)
         if not moves:
@@ -278,22 +318,61 @@ class ToolHead:
             self._calc_print_time()
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
+        trapq_moves = []
+        extra_axis_batches = []
+        for ea in self.extra_axes:
+            process_moves = getattr(ea, 'process_moves', None)
+            axis_moves = None
+            if process_moves is not None:
+                axis_moves = []
+            extra_axis_batches.append((ea, process_moves, axis_moves))
+        batch_move_count = 0
+        # Primary and batch-capable extra-axis trapqs remain private until step
+        # generation begins after this loop.  A third-party extra axis that has
+        # only the established process_move() method retains immediate per-move
+        # submission; process_moves() is an optional optimization and not a new
+        # requirement for existing axis implementations.  Timing callbacks are
+        # the Python-visible boundary, so all native queues and axis position
+        # side effects are explicitly brought current before a callback runs.
         with self.reactor.assert_no_pause():
             for move in moves:
                 if move.is_kinematic_move:
-                    self.trapq_append(
-                        self.trapq, next_move_time,
+                    # Store the exact trapq_append argument order so CFFI can
+                    # convert a contiguous group once.  Keep batches bounded:
+                    # tiny segmented paths can place many moves in lookahead,
+                    # and saving foreign calls must not create an unbounded
+                    # second copy of that queue.  Sixty-four records require
+                    # less than 7KiB while amortizing nearly all call overhead.
+                    trapq_moves.append((
+                        next_move_time,
                         move.accel_t, move.cruise_t, move.decel_t,
                         move.start_pos[0], move.start_pos[1], move.start_pos[2],
                         move.axes_r[0], move.axes_r[1], move.axes_r[2],
-                        move.start_v, move.cruise_v, move.accel)
-                for e_index, ea in enumerate(self.extra_axes):
+                        move.start_v, move.cruise_v, move.accel))
+                for e_index, axis_batch in enumerate(extra_axis_batches):
+                    ea, process_moves, axis_moves = axis_batch
                     if move.axes_d[e_index + 3]:
-                        ea.process_move(next_move_time, move, e_index + 3)
+                        if process_moves is None:
+                            ea.process_move(next_move_time, move, e_index + 3)
+                        else:
+                            axis_moves.append((next_move_time, move,
+                                               e_index + 3))
                 next_move_time = (next_move_time + move.accel_t
                                   + move.cruise_t + move.decel_t)
+                batch_move_count += 1
+                # Bound every per-axis list by counting source moves instead of
+                # primary records.  Extrude-only moves do not enter the primary
+                # trapq, and must not allow an extra-axis batch to grow without
+                # limit.  Flush all queues together so timing callbacks retain
+                # the former append-before-callback guarantee.
+                if (batch_move_count >= TRAPQ_BATCH_SIZE
+                    or move.timing_callbacks):
+                    self._flush_trapq_batches(trapq_moves,
+                                              extra_axis_batches)
+                    batch_move_count = 0
                 for cb in move.timing_callbacks:
                     cb(next_move_time)
+            self._flush_trapq_batches(trapq_moves, extra_axis_batches)
         # Generate steps for moves
         self._advance_move_time(next_move_time)
         self.motion_queuing.note_mcu_movequeue_activity(next_move_time)
@@ -381,6 +460,8 @@ class ToolHead:
     def get_position(self):
         return list(self.commanded_pos)
     def set_position(self, newpos, homing_axes=""):
+        if not all(map(isfinite, newpos)):
+            raise self.printer.command_error("Invalid toolhead position")
         self.flush_step_generation()
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trapq_set_position(self.trapq, self.print_time,
@@ -393,6 +474,9 @@ class ToolHead:
         if last_move is not None:
             last_move.limit_next_junction_speed(speed)
     def move(self, newpos, speed):
+        if (not isfinite(speed) or speed <= 0.
+            or not all(map(isfinite, newpos))):
+            raise self.printer.command_error("Invalid toolhead move")
         move = Move(self, self.commanded_pos, newpos, speed)
         if not move.move_d:
             return

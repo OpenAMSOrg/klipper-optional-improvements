@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import collections, importlib, logging, math, multiprocessing, traceback
+import util
 shaper_defs = importlib.import_module('.shaper_defs', 'extras')
 
 MIN_FREQ = 5.
@@ -465,7 +466,7 @@ class ShaperCalibrate:
                 psd_data_to_write = [
                         calibration_data.psd_x, calibration_data.psd_y,
                         calibration_data.psd_z, calibration_data.psd_sum]
-            with open(output, "w") as csvfile:
+            with util.open_file_for_write(output) as csvfile:
                 csvfile.write("freq,")
                 if len(datasets) > 1:
                     csvfile.write(','.join([self._escape_for_csv(d.name)

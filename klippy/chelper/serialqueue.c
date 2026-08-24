@@ -12,7 +12,8 @@
 // clock times, prioritizes commands, and handles retransmissions.  A
 // background thread is launched to do this work and minimize latency.
 
-#include <linux/can.h> // // struct can_frame
+#define _GNU_SOURCE // recvmmsg, sendmmsg
+#include <linux/can.h> // struct can_frame
 #include <math.h> // fabs
 #include <pthread.h> // pthread_mutex_lock
 #include <stddef.h> // offsetof
@@ -20,7 +21,9 @@
 #include <stdio.h> // snprintf
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#include <sys/socket.h> // recvmmsg, sendmmsg
 #include <termios.h> // tcflush
+#include <time.h> // clock_gettime
 #include <unistd.h> // pipe
 #include "compiler.h" // __visible
 #include "list.h" // list_add_tail
@@ -64,9 +67,10 @@ struct serialqueue {
     // Multi-threaded support for pushing and pulling messages
     struct receiver receiver;
     struct transmit_requests transmit_requests;
-    // Threading
+    // Threading (track lifetime so a naturally exited thread is still joined)
     char name[16];
     pthread_t tid;
+    int thread_started, thread_joined;
     pthread_mutex_t lock; // protects variables below
     // Baud / clock tracking
     int receive_window;
@@ -113,6 +117,9 @@ struct serialqueue {
 
 #define DEBUG_QUEUE_SENT 100
 #define DEBUG_QUEUE_RECEIVE 100
+
+#define CAN_RX_BATCH 16
+#define CAN_TX_BATCH 16
 
 // Create a series of empty messages and add them to a list
 static void
@@ -248,12 +255,13 @@ update_receive_seq(struct serialqueue *sq, double eventtime, uint64_t rseq)
 
 // Process a well formed input message
 static void
-handle_message(struct serialqueue *sq, double eventtime, int len)
+handle_message(struct serialqueue *sq, double eventtime, double receive_time
+               , const uint8_t *msg, int len)
 {
     pthread_mutex_lock(&sq->lock);
 
     // Calculate receive sequence number
-    uint32_t rseq_delta = ((sq->input_buf[MESSAGE_POS_SEQ] - sq->receive_seq)
+    uint32_t rseq_delta = ((msg[MESSAGE_POS_SEQ] - sq->receive_seq)
                            & MESSAGE_SEQ_MASK);
     uint64_t rseq = sq->receive_seq + rseq_delta;
     if (rseq != sq->receive_seq) {
@@ -295,11 +303,10 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
             pollreactor_update_timer(sq->pr, SQPT_RETRANSMIT, PR_NOW);
     } else {
         // Data message - add to receive queue
-        struct queue_message *qm = message_fill(sq->input_buf, len);
+        struct queue_message *qm = message_fill(msg, len);
         qm->sent_time = (rseq > sq->retransmit_seq
                          ? sq->last_receive_sent_time : 0.);
-        qm->receive_time = get_monotonic(); // must be time post read()
-        qm->receive_time -= calculate_bittime(sq, len);
+        qm->receive_time = receive_time - calculate_bittime(sq, len);
         list_add_tail(&qm->node, &received);
     }
 
@@ -310,17 +317,154 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
     struct fastreader *fr;
     list_for_each_entry(fr, &sq->fast_readers, node) {
         if (len < fr->prefix_len + MESSAGE_MIN
-            || memcmp(&sq->input_buf[MESSAGE_HEADER_SIZE]
+            || memcmp(&msg[MESSAGE_HEADER_SIZE]
                       , fr->prefix, fr->prefix_len) != 0)
             continue;
         // Release main lock and invoke callback
         pthread_mutex_lock(&sq->fast_reader_dispatch_lock);
         pthread_mutex_unlock(&sq->lock);
-        fr->func(fr, sq->input_buf, len);
+        fr->func(fr, eventtime, msg, len);
         pthread_mutex_unlock(&sq->fast_reader_dispatch_lock);
         return;
     }
     pthread_mutex_unlock(&sq->lock);
+}
+
+// Process complete frames and retain any incomplete trailing data
+static void
+process_input(struct serialqueue *sq, double eventtime, double receive_time)
+{
+    // Walk each complete frame in place and compact the buffer only once
+    int consumed = 0, invalid = 0;
+    for (;;) {
+        const uint8_t *msg = &sq->input_buf[consumed];
+        int available = sq->input_pos - consumed;
+        int msg_len = msgblock_check(&sq->need_sync, msg, available);
+        if (!msg_len)
+            break;
+        if (msg_len > 0) {
+            // Timestamp after read() when the transport supplied no timestamp
+            if (msg_len > MESSAGE_MIN && !receive_time)
+                receive_time = get_monotonic();
+            handle_message(sq, eventtime, receive_time, msg, msg_len);
+        } else {
+            // Skip malformed data at the beginning of the input
+            msg_len = -msg_len;
+            invalid += msg_len;
+        }
+        consumed += msg_len;
+    }
+    if (invalid) {
+        pthread_mutex_lock(&sq->lock);
+        sq->bytes_invalid += invalid;
+        pthread_mutex_unlock(&sq->lock);
+    }
+    sq->input_pos -= consumed;
+    if (consumed && sq->input_pos)
+        memmove(sq->input_buf, &sq->input_buf[consumed], sq->input_pos);
+}
+
+// Find the kernel receive time in a SocketCAN message
+static double
+can_get_receive_time(struct msghdr *msg, double realtime_to_monotonic
+                     , double fallback_time, int have_clock_offset)
+{
+    if (!have_clock_offset || (msg->msg_flags & MSG_CTRUNC))
+        return fallback_time;
+    struct cmsghdr *cmsg;
+    for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_TIMESTAMPNS
+            || cmsg->cmsg_len < CMSG_LEN(sizeof(struct timespec)))
+            continue;
+        struct timespec ts;
+        memcpy(&ts, CMSG_DATA(cmsg), sizeof(ts));
+        if (ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
+            return fallback_time;
+        double realtime = (double)ts.tv_sec + (double)ts.tv_nsec * .000000001;
+        return realtime + realtime_to_monotonic;
+    }
+    return fallback_time;
+}
+
+// Read a bounded batch of complete SocketCAN records
+static void
+can_input_event(struct serialqueue *sq, double eventtime)
+{
+    struct can_frame frames[CAN_RX_BATCH];
+    struct iovec iov[CAN_RX_BATCH];
+    struct mmsghdr msgs[CAN_RX_BATCH];
+    union {
+        struct cmsghdr align;
+        char data[CMSG_SPACE(sizeof(struct timespec))];
+    } control[CAN_RX_BATCH];
+    memset(msgs, 0, sizeof(msgs));
+    int i;
+    for (i=0; i<CAN_RX_BATCH; i++) {
+        iov[i].iov_base = &frames[i];
+        iov[i].iov_len = sizeof(frames[i]);
+        msgs[i].msg_hdr.msg_iov = &iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_control = control[i].data;
+        msgs[i].msg_hdr.msg_controllen = sizeof(control[i].data);
+    }
+
+    /*
+     * A raw CAN socket is record-oriented, but the old input path consumed only
+     * one record for each poll callback.  A burst therefore required another
+     * poll-reactor pass, timer scan, and read syscall per CAN frame even though
+     * the socket already held the complete batch.  recvmmsg() preserves record
+     * boundaries while amortizing those transitions.  Bound the batch so a
+     * busy CAN interface can not starve command scheduling in this thread.
+     */
+    int count = recvmmsg(sq->serial_fd, msgs, ARRAY_SIZE(msgs), MSG_DONTWAIT,
+                         NULL);
+    if (count < 0) {
+        report_errno("can read", count);
+        pollreactor_do_exit(sq->pr);
+        return;
+    }
+
+    /*
+     * python-can enables nanosecond software timestamps before handing this
+     * socket to serialqueue.  Those timestamps use CLOCK_REALTIME, whereas all
+     * Klipper scheduling uses CLOCK_MONOTONIC_RAW.  Sample both clocks once for
+     * this batch and translate each kernel timestamp into the scheduler's time
+     * domain.  Falling back to the post-read monotonic time retains the prior
+     * behavior if an older SocketCAN implementation supplies no control data.
+     */
+    struct timespec realtime_now;
+    int have_clock_offset = !clock_gettime(CLOCK_REALTIME, &realtime_now);
+    double fallback_time = get_monotonic(), realtime_to_monotonic = 0.;
+    if (have_clock_offset) {
+        double realtime = ((double)realtime_now.tv_sec
+                           + (double)realtime_now.tv_nsec * .000000001);
+        realtime_to_monotonic = fallback_time - realtime;
+    }
+
+    for (i=0; i<count; i++) {
+        if (msgs[i].msg_len != sizeof(frames[i])
+            || (msgs[i].msg_hdr.msg_flags & MSG_TRUNC)) {
+            errorf("Got incomplete CAN frame (size=%u)", msgs[i].msg_len);
+            pollreactor_do_exit(sq->pr);
+            return;
+        }
+        struct can_frame *cf = &frames[i];
+        if (cf->can_dlc > CAN_MAX_DLEN
+            || cf->can_dlc > sizeof(sq->input_buf) - sq->input_pos) {
+            errorf("Got invalid CAN frame length: %d", cf->can_dlc);
+            pollreactor_do_exit(sq->pr);
+            return;
+        }
+        if (cf->can_id != sq->client_id + 1)
+            continue;
+        memcpy(&sq->input_buf[sq->input_pos], cf->data, cf->can_dlc);
+        sq->input_pos += cf->can_dlc;
+        double receive_time = can_get_receive_time(
+            &msgs[i].msg_hdr, realtime_to_monotonic, fallback_time,
+            have_clock_offset);
+        // Process now so a completed block retains its final frame's timestamp
+        process_input(sq, eventtime, receive_time);
+    }
 }
 
 // Callback for input activity on the serial fd
@@ -328,17 +472,8 @@ static void
 input_event(struct serialqueue *sq, double eventtime)
 {
     if (sq->serial_fd_type == SQT_CAN) {
-        struct can_frame cf;
-        int ret = read(sq->serial_fd, &cf, sizeof(cf));
-        if (ret <= 0) {
-            report_errno("can read", ret);
-            pollreactor_do_exit(sq->pr);
-            return;
-        }
-        if (cf.can_id != sq->client_id + 1)
-            return;
-        memcpy(&sq->input_buf[sq->input_pos], cf.data, cf.can_dlc);
-        sq->input_pos += cf.can_dlc;
+        can_input_event(sq, eventtime);
+        return;
     } else {
         int ret = read(sq->serial_fd, &sq->input_buf[sq->input_pos]
                        , sizeof(sq->input_buf) - sq->input_pos);
@@ -352,25 +487,7 @@ input_event(struct serialqueue *sq, double eventtime)
         }
         sq->input_pos += ret;
     }
-    for (;;) {
-        int len = msgblock_check(&sq->need_sync, sq->input_buf, sq->input_pos);
-        if (!len)
-            // Need more data
-            return;
-        if (len > 0) {
-            // Received a valid message
-            handle_message(sq, eventtime, len);
-        } else {
-            // Skip bad data at beginning of input
-            len = -len;
-            pthread_mutex_lock(&sq->lock);
-            sq->bytes_invalid += len;
-            pthread_mutex_unlock(&sq->lock);
-        }
-        sq->input_pos -= len;
-        if (sq->input_pos)
-            memmove(sq->input_buf, &sq->input_buf[len], sq->input_pos);
-    }
+    process_input(sq, eventtime, 0.);
 }
 
 // Callback for input activity on the pipe fd (wakes command_event)
@@ -394,14 +511,67 @@ do_write(struct serialqueue *sq, void *buf, int buflen)
             report_errno("write", ret);
         return;
     }
-    // Write to CAN fd
-    struct can_frame cf;
+    /*
+     * SocketCAN preserves one struct can_frame as one CAN packet.  Prepare a
+     * bounded vector of those records so a run of stream fragments crosses
+     * into the kernel once instead of issuing one write() for every eight
+     * bytes.  Sixteen frames cover 128 stream bytes and keep both stack use
+     * and the interval covered by a single system call bounded; command
+     * scheduling gets another opportunity between larger batches.
+     *
+     * Each iovec points at its own frame.  Reusing one frame for the complete
+     * vector would leave every entry referring to the final payload by the
+     * time sendmmsg() inspects it.  Zero the complete frame array as the
+     * kernel-visible padding bytes are outside can_dlc but are still part of
+     * every fixed-size SocketCAN record.
+     */
+    struct can_frame frames[CAN_TX_BATCH];
+    struct iovec iov[CAN_TX_BATCH];
+    struct mmsghdr msgs[CAN_TX_BATCH];
+    uint8_t *data = buf;
     while (buflen) {
-        int size = buflen > 8 ? 8 : buflen;
-        cf.can_id = sq->client_id;
-        cf.can_dlc = size;
-        memcpy(cf.data, buf, size);
-        int ret = write(sq->serial_fd, &cf, sizeof(cf));
+        memset(frames, 0, sizeof(frames));
+        memset(msgs, 0, sizeof(msgs));
+        int frame_count = DIV_ROUND_UP(buflen, CAN_MAX_DLEN);
+        if (frame_count > CAN_TX_BATCH)
+            frame_count = CAN_TX_BATCH;
+        int pos = 0, i;
+        for (i=0; i<frame_count; i++) {
+            struct can_frame *cf = &frames[i];
+            int size = buflen - pos;
+            if (size > CAN_MAX_DLEN)
+                size = CAN_MAX_DLEN;
+            cf->can_id = sq->client_id;
+            cf->can_dlc = size;
+            memcpy(cf->data, &data[pos], size);
+            iov[i].iov_base = cf;
+            iov[i].iov_len = sizeof(*cf);
+            msgs[i].msg_hdr.msg_iov = &iov[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            pos += size;
+        }
+
+        int ret = sendmmsg(sq->serial_fd, msgs, frame_count, 0);
+        /*
+         * A positive return is the number of complete records accepted, not a
+         * byte count.  Linux may accept only a prefix if the socket becomes
+         * full part way through the vector.  Advance by exactly that prefix
+         * and present the remaining records again; treating the return as
+         * success for the complete vector would silently remove the suffix
+         * from Klipper's byte stream.  The follow-up call also recovers the
+         * otherwise hidden errno for the first unaccepted record.
+         *
+         * Successful SocketCAN records must each contain one complete struct
+         * can_frame.  A shorter positive msg_len would describe a different
+         * record boundary and can not be resumed without corrupting the
+         * stream, so retain the fatal invariant check from the single-record
+         * implementation.
+         */
+        if (!ret) {
+            errorf("Incomplete CAN frame batch write (count=0)");
+            pollreactor_do_exit(sq->pr);
+            return;
+        }
         if (ret < 0) {
             report_errno("can write", ret);
             double curtime = get_monotonic();
@@ -413,9 +583,19 @@ do_write(struct serialqueue *sq, void *buf, int buflen)
             }
             return;
         }
+        int sent_bytes = 0;
+        for (i=0; i<ret; i++) {
+            if (msgs[i].msg_len != sizeof(frames[i])) {
+                errorf("Incomplete CAN frame write (size=%u)",
+                       msgs[i].msg_len);
+                pollreactor_do_exit(sq->pr);
+                return;
+            }
+            sent_bytes += frames[i].can_dlc;
+        }
         sq->last_write_fail_time = 0.0;
-        buf += size;
-        buflen -= size;
+        data += sent_bytes;
+        buflen -= sent_bytes;
     }
 }
 
@@ -508,12 +688,8 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
 
     // Fill header / trailer
     len += MESSAGE_TRAILER_SIZE;
-    buf[MESSAGE_POS_LEN] = len;
-    buf[MESSAGE_POS_SEQ] = MESSAGE_DEST | (sq->send_seq & MESSAGE_SEQ_MASK);
-    uint16_t crc = msgblock_crc16_ccitt(buf, len - MESSAGE_TRAILER_SIZE);
-    buf[len - MESSAGE_TRAILER_CRC] = crc >> 8;
-    buf[len - MESSAGE_TRAILER_CRC+1] = crc & 0xff;
-    buf[len - MESSAGE_TRAILER_SYNC] = MESSAGE_SYNC;
+    msgblock_finalize(buf, len,
+                      MESSAGE_DEST | (sq->send_seq & MESSAGE_SEQ_MASK));
 
     // Store message block
     double idletime = eventtime > sq->idle_time ? eventtime : sq->idle_time;
@@ -776,6 +952,7 @@ serialqueue_alloc(int serial_fd, char serial_fd_type, int client_id
     ret = pthread_create(&sq->tid, NULL, background_thread, sq);
     if (ret)
         goto fail;
+    sq->thread_started = 1;
 
     return sq;
 
@@ -788,11 +965,15 @@ fail:
 void __visible
 serialqueue_exit(struct serialqueue *sq)
 {
+    if (!sq || !sq->thread_started || sq->thread_joined)
+        return;
     pollreactor_do_exit(sq->pr);
     kick_bg_thread(sq);
     int ret = pthread_join(sq->tid, NULL);
     if (ret)
         report_errno("pthread_join", ret);
+    else
+        sq->thread_joined = 1;
 }
 
 // Free all resources associated with a serialqueue
@@ -801,7 +982,7 @@ serialqueue_free(struct serialqueue *sq)
 {
     if (!sq)
         return;
-    if (!pollreactor_is_exit(sq->pr))
+    if (!sq->thread_joined)
         serialqueue_exit(sq);
     pthread_mutex_lock(&sq->lock);
     message_queue_free(&sq->sent_queue);
@@ -828,6 +1009,8 @@ serialqueue_free(struct serialqueue *sq)
     pthread_mutex_unlock(&sq->transmit_requests.lock);
     pthread_mutex_unlock(&sq->lock);
     pollreactor_free(sq->pr);
+    close(sq->transmit_requests.pipe_fds[0]);
+    close(sq->transmit_requests.pipe_fds[1]);
     free(sq);
 }
 
@@ -937,7 +1120,13 @@ serialqueue_send(struct serialqueue *sq, struct command_queue *cq, uint8_t *msg
                  , int len, uint64_t min_clock, uint64_t req_clock
                  , uint64_t notify_id)
 {
+    if (len < 0 || len > MESSAGE_PAYLOAD_MAX) {
+        errorf("Invalid serial message length: %d", len);
+        return;
+    }
     struct queue_message *qm = message_fill(msg, len);
+    if (!qm)
+        return;
     qm->min_clock = min_clock;
     qm->req_clock = req_clock;
     qm->notify_id = notify_id;
@@ -1008,11 +1197,10 @@ serialqueue_set_receive_window(struct serialqueue *sq, int receive_window)
 // serial port
 void __visible
 serialqueue_set_clock_est(struct serialqueue *sq, double est_freq
-                          , double conv_time, uint64_t conv_clock
-                          , uint64_t last_clock)
+                          , double conv_time, uint64_t conv_clock)
 {
     pthread_mutex_lock(&sq->lock);
-    clock_fill(&sq->ce, est_freq, conv_time, conv_clock, last_clock);
+    clock_fill(&sq->ce, est_freq, conv_time, conv_clock);
     pthread_mutex_unlock(&sq->lock);
 }
 
@@ -1029,6 +1217,8 @@ serialqueue_get_clock_est(struct serialqueue *sq, struct clock_estimate *ce)
 void __visible
 serialqueue_get_stats(struct serialqueue *sq, char *buf, int len)
 {
+    if (!buf || len <= 0)
+        return;
     struct serialqueue stats;
     pthread_mutex_lock(&sq->lock);
     pthread_mutex_lock(&sq->transmit_requests.lock);

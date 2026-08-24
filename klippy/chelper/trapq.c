@@ -164,6 +164,33 @@ trapq_append(struct trapq *tq, double print_time
     }
 }
 
+// Append several Python-planned moves through one foreign-function call
+void __visible
+trapq_append_batch(struct trapq *tq, const struct trapq_append_move *moves
+                   , int move_count)
+{
+    /*
+     * Keep trapq_append() as the single implementation of segment creation,
+     * null-gap insertion, coordinate advancement, and sentinel maintenance.
+     * The batch entry point exists only to amortize the host's CFFI transition;
+     * duplicating that stateful logic in a nominally faster loop would make the
+     * two APIs vulnerable to subtle ordering or numerical differences.
+     *
+     * The host bounds move_count and the cdata array remains alive for this
+     * synchronous call.  Consume each record immediately and retain no pointer
+     * into Python-owned storage after returning.
+     */
+    int i;
+    for (i = 0; i < move_count; i++) {
+        const struct trapq_append_move *m = &moves[i];
+        trapq_append(tq, m->print_time,
+                     m->accel_t, m->cruise_t, m->decel_t,
+                     m->start_pos_x, m->start_pos_y, m->start_pos_z,
+                     m->axes_r_x, m->axes_r_y, m->axes_r_z,
+                     m->start_v, m->cruise_v, m->accel);
+    }
+}
+
 // Expire any moves older than `print_time` from the trapezoid velocity queue
 void __visible
 trapq_finalize_moves(struct trapq *tq, double print_time

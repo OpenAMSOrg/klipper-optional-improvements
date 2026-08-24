@@ -26,7 +26,7 @@ class GCodeMove:
                                desc=self.cmd_GET_POSITION_help)
         self.Coord = gcode.Coord
         # G-Code coordinate manipulation
-        self.absolute_coord = self.absolute_extrude = True
+        self.absolute_coord = self.allow_absolute_extrude = True
         self.base_position = [0.0, 0.0, 0.0, 0.0]
         self.last_position = [0.0, 0.0, 0.0, 0.0]
         self.homing_position = [0.0, 0.0, 0.0, 0.0]
@@ -68,7 +68,7 @@ class GCodeMove:
         logging.info("gcode state: absolute_coord=%s absolute_extrude=%s"
                      " base_position=%s last_position=%s homing_position=%s"
                      " speed_factor=%s extrude_factor=%s speed=%s",
-                     self.absolute_coord, self.absolute_extrude,
+                     self.absolute_coord, self.allow_absolute_extrude,
                      self.base_position, self.last_position,
                      self.homing_position, self.speed_factor,
                      self.extrude_factor, self.speed)
@@ -106,7 +106,7 @@ class GCodeMove:
             'speed': self._get_gcode_speed(),
             'extrude_factor': self.extrude_factor,
             'absolute_coordinates': self.absolute_coord,
-            'absolute_extrude': self.absolute_extrude,
+            'absolute_extrude': self.allow_absolute_extrude,
             'homing_origin': self.Coord(self.homing_position),
             'position': self.Coord(self.last_position),
             'gcode_position': self.Coord(move_position),
@@ -134,30 +134,26 @@ class GCodeMove:
     def cmd_G1(self, gcmd):
         # Move
         params = gcmd.get_command_parameters()
-        try:
-            for axis, pos in self.axis_map.items():
-                if axis in params:
-                    v = float(params[axis])
-                    absolute_coord = self.absolute_coord
-                    if axis == 'E':
-                        v *= self.extrude_factor
-                        if not self.absolute_extrude:
-                            absolute_coord = False
-                    if not absolute_coord:
-                        # value relative to position of last move
-                        self.last_position[pos] += v
-                    else:
-                        # value relative to base coordinate position
-                        self.last_position[pos] = v + self.base_position[pos]
-            if 'F' in params:
-                gcode_speed = float(params['F'])
-                if gcode_speed <= 0.:
-                    raise gcmd.error("Invalid speed in '%s'"
-                                     % (gcmd.get_commandline(),))
-                self.speed = gcode_speed * self.speed_factor
-        except ValueError as e:
-            raise gcmd.error("Unable to parse move '%s'"
-                             % (gcmd.get_commandline(),))
+        parsed_axes = {axis: gcmd.get_float(axis)
+                       for axis in self.axis_map if axis in params}
+        gcode_speed = None
+        if 'F' in params:
+            gcode_speed = gcmd.get_float('F', above=0.)
+        for axis, v in parsed_axes.items():
+            pos = self.axis_map[axis]
+            absolute_coord = self.absolute_coord
+            if axis == 'E':
+                v *= self.extrude_factor
+                if not self.allow_absolute_extrude:
+                    absolute_coord = False
+            if not absolute_coord:
+                # value relative to position of last move
+                self.last_position[pos] += v
+            else:
+                # value relative to base coordinate position
+                self.last_position[pos] = v + self.base_position[pos]
+        if gcode_speed is not None:
+            self.speed = gcode_speed * self.speed_factor
         self.move_with_transform(self.last_position, self.speed)
     # G-Code coordinate manipulation
     def cmd_G20(self, gcmd):
@@ -167,11 +163,11 @@ class GCodeMove:
         # Set units to millimeters
         pass
     def cmd_M82(self, gcmd):
-        # Use absolute distances for extrusion
-        self.absolute_extrude = True
+        # Don't force relative distances for extrusion
+        self.allow_absolute_extrude = True
     def cmd_M83(self, gcmd):
-        # Use relative distances for extrusion
-        self.absolute_extrude = False
+        # Force relative distances for extrusion
+        self.allow_absolute_extrude = False
     def cmd_G90(self, gcmd):
         # Use absolute coordinates
         self.absolute_coord = True
@@ -229,7 +225,7 @@ class GCodeMove:
         state_name = gcmd.get('NAME', 'default')
         self.saved_states[state_name] = {
             'absolute_coord': self.absolute_coord,
-            'absolute_extrude': self.absolute_extrude,
+            'allow_absolute_extrude': self.allow_absolute_extrude,
             'base_position': list(self.base_position),
             'last_position': list(self.last_position),
             'homing_position': list(self.homing_position),
@@ -244,7 +240,7 @@ class GCodeMove:
             raise gcmd.error("Unknown g-code state: %s" % (state_name,))
         # Restore state
         self.absolute_coord = state['absolute_coord']
-        self.absolute_extrude = state['absolute_extrude']
+        self.allow_absolute_extrude = state['allow_absolute_extrude']
         self.base_position[:4] = state['base_position'][:4]
         self.homing_position = list(state['homing_position'])
         self.speed = state['speed']

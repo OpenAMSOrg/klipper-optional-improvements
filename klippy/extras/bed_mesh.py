@@ -78,6 +78,8 @@ def parse_gcmd_pair(gcmd, name, minval=None, maxval=None):
 def parse_gcmd_coord(gcmd, name):
     try:
         v1, v2 = [float(v.strip()) for v in gcmd.get(name).split(',')]
+        if any(math.isnan(v) or math.isinf(v) for v in (v1, v2)):
+            raise ValueError
     except:
         raise gcmd.error("Unable to parse parameter '%s'" % (name,))
     return v1, v2

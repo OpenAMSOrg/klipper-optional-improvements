@@ -6,7 +6,8 @@
 
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
-#include <string.h> // memset
+#include <string.h> // memchr
+#include "compiler.h" // likely
 #include "msgblock.h" // message_alloc
 #include "pyhelper.h" // errorf
 
@@ -17,7 +18,7 @@
 
 // Implement the standard crc "ccitt" algorithm on the given buffer
 uint16_t
-msgblock_crc16_ccitt(uint8_t *buf, uint8_t len)
+msgblock_crc16_ccitt(const uint8_t *buf, uint8_t len)
 {
     uint16_t crc = 0xffff;
     while (len--) {
@@ -30,36 +31,51 @@ msgblock_crc16_ccitt(uint8_t *buf, uint8_t len)
     return crc;
 }
 
-// Verify a buffer starts with a valid mcu message
-int
-msgblock_check(uint8_t *need_sync, uint8_t *buf, int buf_len)
+// Add framing bytes to an encoded message
+void
+msgblock_finalize(uint8_t *buf, uint8_t msg_len, uint8_t sequence)
 {
+    buf[MESSAGE_POS_LEN] = msg_len;
+    buf[MESSAGE_POS_SEQ] = sequence;
+    uint16_t crc = msgblock_crc16_ccitt(
+        buf, msg_len - MESSAGE_TRAILER_SIZE);
+    buf[msg_len - MESSAGE_TRAILER_CRC] = crc >> 8;
+    buf[msg_len - MESSAGE_TRAILER_CRC + 1] = crc;
+    buf[msg_len - MESSAGE_TRAILER_SYNC] = MESSAGE_SYNC;
+}
+
+// Verify a buffer starts with a valid MCU message.  Return the message
+// length, zero when more data is needed, or a negative discard length.
+int
+msgblock_check(uint8_t *need_sync, const uint8_t *buf, int buf_len)
+{
+    const uint8_t *next_sync;
     if (buf_len < MESSAGE_MIN)
         // Need more data
         return 0;
     if (*need_sync)
-        goto error;
+        goto resync;
     uint8_t msglen = buf[MESSAGE_POS_LEN];
     if (msglen < MESSAGE_MIN || msglen > MESSAGE_MAX)
-        goto error;
+        goto resync;
     uint8_t msgseq = buf[MESSAGE_POS_SEQ];
     if ((msgseq & ~MESSAGE_SEQ_MASK) != MESSAGE_DEST)
-        goto error;
+        goto resync;
     if (buf_len < msglen)
         // Need more data
         return 0;
-    if (buf[msglen-MESSAGE_TRAILER_SYNC] != MESSAGE_SYNC)
-        goto error;
-    uint16_t msgcrc = ((buf[msglen-MESSAGE_TRAILER_CRC] << 8)
-                       | (uint8_t)buf[msglen-MESSAGE_TRAILER_CRC+1]);
+    if (buf[msglen - MESSAGE_TRAILER_SYNC] != MESSAGE_SYNC)
+        goto resync;
+    uint16_t msgcrc = ((buf[msglen - MESSAGE_TRAILER_CRC] << 8)
+                       | buf[msglen - MESSAGE_TRAILER_CRC + 1]);
     uint16_t crc = msgblock_crc16_ccitt(buf, msglen-MESSAGE_TRAILER_SIZE);
-    if (crc != msgcrc)
-        goto error;
+    if (msgcrc != crc)
+        goto resync;
     return msglen;
 
-error: ;
-    // Discard bytes until next SYNC found
-    uint8_t *next_sync = memchr(buf, MESSAGE_SYNC, buf_len);
+resync:
+    // Discard through the next sync byte before testing another frame
+    next_sync = memchr(buf, MESSAGE_SYNC, buf_len);
     if (next_sync) {
         *need_sync = 0;
         return -(next_sync - buf + 1);
@@ -70,47 +86,68 @@ error: ;
 
 // Encode an integer as a variable length quantity (vlq)
 static uint8_t *
-encode_int(uint8_t *p, uint32_t v)
+vlq_encode(uint8_t *p, uint32_t v)
 {
+    // The first group has six value bits and a sign bit; each additional
+    // group contributes seven value bits.
     int32_t sv = v;
-    if (sv < (3L<<5)  && sv >= -(1L<<5))  goto f4;
-    if (sv < (3L<<12) && sv >= -(1L<<12)) goto f3;
-    if (sv < (3L<<19) && sv >= -(1L<<19)) goto f2;
-    if (sv < (3L<<26) && sv >= -(1L<<26)) goto f1;
-    *p++ = (v>>28) | 0x80;
-f1: *p++ = ((v>>21) & 0x7f) | 0x80;
-f2: *p++ = ((v>>14) & 0x7f) | 0x80;
-f3: *p++ = ((v>>7) & 0x7f) | 0x80;
-f4: *p++ = v & 0x7f;
+    if (likely(sv >= -(1L << 5) && sv < (3L << 5)))
+        goto one_byte;
+    if (sv >= -(1L << 12) && sv < (3L << 12))
+        goto two_bytes;
+    if (sv >= -(1L << 19) && sv < (3L << 19))
+        goto three_bytes;
+    if (sv >= -(1L << 26) && sv < (3L << 26))
+        goto four_bytes;
+    *p++ = (v >> 28) | 0x80;
+four_bytes:
+    *p++ = ((v >> 21) & 0x7f) | 0x80;
+three_bytes:
+    *p++ = ((v >> 14) & 0x7f) | 0x80;
+two_bytes:
+    *p++ = ((v >> 7) & 0x7f) | 0x80;
+one_byte:
+    *p++ = v & 0x7f;
     return p;
 }
 
-// Parse an integer that was encoded as a "variable length quantity"
-static uint32_t
-parse_int(uint8_t **pp)
+// Parse a bounded variable length quantity (vlq)
+static int
+vlq_decode(const uint8_t **pp, const uint8_t *end, uint32_t *value)
 {
-    uint8_t *p = *pp, c = *p++;
+    const uint8_t *p = *pp;
+    if (p >= end)
+        return -1;
+    uint8_t c = *p++;
     uint32_t v = c & 0x7f;
     if ((c & 0x60) == 0x60)
         v |= -0x20;
+    int count = 1;
     while (c & 0x80) {
+        if (p >= end || count >= 5)
+            return -1;
         c = *p++;
-        v = (v<<7) | (c & 0x7f);
+        v = (v << 7) | (c & 0x7f);
+        count++;
     }
     *pp = p;
-    return v;
+    *value = v;
+    return 0;
 }
 
 // Parse the VLQ contents of a message
 int
-msgblock_decode(uint32_t *data, int data_len, uint8_t *msg, int msg_len)
+msgblock_decode(uint32_t *data, int data_len
+                , const uint8_t *msg, int msg_len)
 {
-    uint8_t *p = &msg[MESSAGE_HEADER_SIZE];
-    uint8_t *end = &msg[msg_len - MESSAGE_TRAILER_SIZE];
+    if (data_len < 0 || (!data && data_len) || !msg
+        || msg_len < MESSAGE_MIN || msg_len > MESSAGE_MAX)
+        return -1;
+    const uint8_t *p = &msg[MESSAGE_HEADER_SIZE];
+    const uint8_t *end = &msg[msg_len - MESSAGE_TRAILER_SIZE];
     while (data_len--) {
-        if (p >= end)
+        if (vlq_decode(&p, end, data++))
             return -1;
-        *data++ = parse_int(&p);
     }
     if (p != end)
         // Invalid message
@@ -128,29 +165,38 @@ struct queue_message *
 message_alloc(void)
 {
     struct queue_message *qm = malloc(sizeof(*qm));
-    memset(qm, 0, sizeof(*qm));
+    qm->len = 0;
+    qm->min_clock = qm->req_clock = 0;
+    qm->notify_id = 0;
     return qm;
 }
 
 // Allocate a queue_message and fill it with the specified data
 struct queue_message *
-message_fill(uint8_t *data, int len)
+message_fill(const uint8_t *data, int len)
 {
+    if (len < 0 || len > MESSAGE_MAX || (!data && len)) {
+        errorf("Invalid message length: %d", len);
+        return NULL;
+    }
     struct queue_message *qm = message_alloc();
-    memcpy(qm->msg, data, len);
+    if (len)
+        memcpy(qm->msg, data, len);
     qm->len = len;
     return qm;
 }
 
 // Allocate a queue_message and fill it with a series of encoded vlq integers
 struct queue_message *
-message_alloc_and_encode(uint32_t *data, int len)
+message_alloc_and_encode(const uint32_t *data, int len)
 {
     struct queue_message *qm = message_alloc();
+    if ((unsigned int)len > MESSAGE_PAYLOAD_MAX || (!data && len))
+        goto fail;
     int i;
     uint8_t *p = qm->msg;
     for (i=0; i<len; i++) {
-        p = encode_int(p, data[i]);
+        p = vlq_encode(p, data[i]);
         if (p > &qm->msg[MESSAGE_PAYLOAD_MAX])
             goto fail;
     }
@@ -184,15 +230,20 @@ message_queue_free(struct list_head *root)
 
 
 /****************************************************************
- * Clock estimation
+ * Clock conversion from 32bit to 64bit
  ****************************************************************/
 
 // Extend a 32bit clock value to its full 64bit value
 uint64_t
-clock_from_clock32(struct clock_estimate *ce, uint32_t clock32)
+clock_from_clock32(uint64_t last_clock, uint32_t clock32)
 {
-    return ce->last_clock + (int32_t)(clock32 - ce->last_clock);
+    return last_clock + (int32_t)(clock32 - last_clock);
 }
+
+
+/****************************************************************
+ * Clock estimation
+ ****************************************************************/
 
 // Convert a clock to its estimated time
 double
@@ -211,10 +262,9 @@ clock_from_time(struct clock_estimate *ce, double time)
 // Fill the fields of a 'struct clock_estimate'
 void
 clock_fill(struct clock_estimate *ce, double est_freq, double conv_time
-           , uint64_t conv_clock, uint64_t last_clock)
+           , uint64_t conv_clock)
 {
     ce->est_freq = est_freq;
     ce->conv_time = conv_time;
     ce->conv_clock = conv_clock;
-    ce->last_clock = last_clock;
 }

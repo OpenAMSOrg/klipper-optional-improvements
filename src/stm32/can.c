@@ -169,7 +169,8 @@ canhw_set_filter(uint32_t id)
 }
 
 static struct {
-    uint32_t rx_error, tx_error;
+    uint32_t rx_error, tx_error, rx_overflows, bus_off;
+    uint8_t bus_off_active;
 } CAN_Errors;
 
 // Report interface status
@@ -178,11 +179,30 @@ canhw_get_status(struct canbus_status *status)
 {
     irqstatus_t flag = irq_save();
     uint32_t esr = SOC_CAN->ESR;
+    /*
+     * Normally the error interrupt records this transition.  Also sample it
+     * here so diagnostics remain truthful if status is queried after bus-off
+     * but before the shared or temporarily masked error vector is serviced.
+     * The active latch prevents repeated status queries from counting the same
+     * episode; ABOM clearing BOFF rearms the next transition.
+     */
+    if (esr & CAN_ESR_BOFF) {
+        if (!CAN_Errors.bus_off_active) {
+            CAN_Errors.bus_off_active = 1;
+            CAN_Errors.bus_off++;
+        }
+    } else {
+        CAN_Errors.bus_off_active = 0;
+    }
     uint32_t rx_error = CAN_Errors.rx_error, tx_error = CAN_Errors.tx_error;
+    uint32_t rx_overflows = CAN_Errors.rx_overflows;
+    uint32_t bus_off = CAN_Errors.bus_off;
     irq_restore(flag);
 
     status->rx_error = rx_error;
     status->tx_error = tx_error;
+    status->rx_overflows = rx_overflows;
+    status->bus_off = bus_off;
     if (esr & CAN_ESR_BOFF)
         status->bus_state = CANBUS_STATE_OFF;
     else if (esr & CAN_ESR_EPVF)
@@ -197,7 +217,38 @@ canhw_get_status(struct canbus_status *status)
 void
 CAN_IRQHandler(void)
 {
-    if (SOC_CAN->RF0R & CAN_RF0R_FMP0) {
+    uint32_t rf0r = SOC_CAN->RF0R;
+    if (rf0r & CAN_RF0R_FOVR0) {
+        /*
+         * FIFO overrun means a valid frame reached bxCAN but could not be
+         * retained until software read it.  This is not a protocol receive
+         * error and therefore is absent from ESR's error counters.  Clear the
+         * sticky indication and retain a separate wrapping count.  One flag
+         * may cover several losses during a sustained overload, so the result
+         * is an actionable lower bound rather than a fabricated exact total.
+         */
+        SOC_CAN->RF0R = CAN_RF0R_FOVR0;
+        CAN_Errors.rx_overflows++;
+    }
+    /*
+     * FMP0 is the number of complete frames already resident in the three-slot
+     * FIFO, not merely a boolean pending flag.  Processing one entry and
+     * returning leaves the interrupt asserted for the next entry, forcing the
+     * Cortex-M to repeat exception return and entry plus every unrelated status
+     * check below.  Snapshot the count and process that arrival batch in one
+     * invocation so the fixed interrupt cost is paid once for up to three CAN
+     * frames.
+     *
+     * Use the entry snapshot instead of polling FMP0 until empty.  A
+     * continuously busy bus can refill a slot after RFOM0 returns it; chasing
+     * that live level would make interrupt residency traffic-dependent and
+     * could postpone higher-level scheduler work indefinitely.  Any frame
+     * arriving after the snapshot leaves FMP0 asserted and causes the normal
+     * next interrupt, while this invocation remains strictly bounded by the
+     * hardware FIFO depth.
+     */
+    uint32_t pending = rf0r & CAN_RF0R_FMP0;
+    while (pending--) {
         // Read and ack data packet
         CAN_FIFOMailBox_TypeDef *mb = &SOC_CAN->sFIFOMailBox[0];
         uint32_t rir = mb->RIR;
@@ -229,6 +280,14 @@ CAN_IRQHandler(void)
     uint32_t msr = SOC_CAN->MSR;
     if (msr & CAN_MSR_ERRI) {
         uint32_t esr = SOC_CAN->ESR;
+        if (esr & CAN_ESR_BOFF) {
+            if (!CAN_Errors.bus_off_active) {
+                CAN_Errors.bus_off_active = 1;
+                CAN_Errors.bus_off++;
+            }
+        } else {
+            CAN_Errors.bus_off_active = 0;
+        }
         uint32_t lec = (esr & CAN_ESR_LEC_Msk) >> CAN_ESR_LEC_Pos;
         if (lec && lec != 7) {
             SOC_CAN->ESR = 7 << CAN_ESR_LEC_Pos;
@@ -271,6 +330,15 @@ compute_btr(uint32_t pclock, uint32_t bitrate)
         Use the lowest brp where ts1 and ts2 are in valid range
      */
 
+    /*
+     * Do not round a requested bus rate through integer division.  The value
+     * exported as CANBUS_FREQUENCY must describe the bit period programmed into
+     * bxCAN exactly; otherwise this node can sample at a different rate from
+     * clients which trusted that constant.  Require both exact clock division
+     * and the controller's legal 1..1024 prescaler range.
+     */
+    if (!bitrate || pclock % bitrate)
+        return CAN_INVALID_BTR;
     uint32_t bit_clocks = pclock / bitrate; // clock ticks per bit
 
     uint32_t sjw = 2;
@@ -278,15 +346,16 @@ compute_btr(uint32_t pclock, uint32_t bitrate)
     // Find number of time quantas that gives us the exact wanted bit time
     for (qs = 18; qs > 9; qs--) {
         // check that bit_clocks / quantas is an integer
-        uint32_t brp_rem = bit_clocks % qs;
-        if (brp_rem == 0)
-            break;
+        if (bit_clocks % qs)
+            continue;
+        uint32_t brp = bit_clocks / qs;
+        if (!brp || brp > 1024)
+            continue;
+        uint32_t time_seg2 = qs / 8; // sample at ~87.5%
+        uint32_t time_seg1 = qs - (1 + time_seg2);
+        return make_btr(sjw, time_seg1, time_seg2, brp);
     }
-    uint32_t brp       = bit_clocks / qs;
-    uint32_t time_seg2 = qs / 8; // sample at ~87.5%
-    uint32_t time_seg1 = qs - (1 + time_seg2);
-
-    return make_btr(sjw, time_seg1, time_seg2, brp);
+    return CAN_INVALID_BTR;
 }
 
 void
@@ -304,6 +373,10 @@ can_init(void)
     uint32_t pclock = get_pclock_frequency((uint32_t)SOC_CAN);
 
     uint32_t btr = compute_btr(pclock, CONFIG_CANBUS_FREQUENCY);
+    if (btr == CAN_INVALID_BTR) {
+        canserial_set_invalid_bitrate();
+        return;
+    }
 
     /*##-1- Configure the CAN #######################################*/
 
@@ -333,6 +406,7 @@ can_init(void)
         armcm_enable_irq(CAN_IRQHandler, CAN_TX_IRQn, 0);
     if (CAN_RX0_IRQn != CAN_SCE_IRQn)
         armcm_enable_irq(CAN_IRQHandler, CAN_SCE_IRQn, 0);
-    SOC_CAN->IER = CAN_IER_FMPIE0 | CAN_IER_ERRIE | CAN_IER_LECIE;
+    SOC_CAN->IER = (CAN_IER_FMPIE0 | CAN_IER_FOVIE0
+                    | CAN_IER_ERRIE | CAN_IER_LECIE);
 }
 DECL_INIT(can_init);

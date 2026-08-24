@@ -18,7 +18,7 @@ class VirtualSD:
         self.printer = config.get_printer()
         # sdcard state
         sd = config.get('path')
-        self.sdcard_dirname = os.path.normpath(os.path.expanduser(sd))
+        self.sdcard_dirname = os.path.realpath(os.path.expanduser(sd))
         self.current_file = None
         self.file_position = self.file_size = 0
         # Print Stat Tracking
@@ -30,6 +30,8 @@ class VirtualSD:
         self.work_timer = None
         # Error handling
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        aio = self.printer.load_object(config, 'aio_executor')
+        self.executor = aio.allocate_executor("virtual_sdcard")
         self.on_error_gcode = gcode_macro.load_template(
             config, 'on_error_gcode', DEFAULT_ERROR_GCODE)
         # Register commands
@@ -46,20 +48,30 @@ class VirtualSD:
             desc=self.cmd_SDCARD_PRINT_FILE_help)
         self.printer.register_event_handler("klippy:analyze_shutdown",
                                             self._handle_analyze_shutdown)
+        self.printer.register_event_handler("gcode:debuginput_exit",
+                                            self._handle_debuginput_exit)
     def _handle_analyze_shutdown(self, msg, details):
-        if self.work_timer is not None:
-            self.must_pause_work = True
+        if self.work_timer is None:
+            return
+        file_position = self.file_position
+        current_file = self.current_file
+        self.must_pause_work = True
+        def log_debug_data(eventtime):
             try:
-                readpos = max(self.file_position - 1024, 0)
-                readcount = self.file_position - readpos
-                self.current_file.seek(readpos)
-                data = self.current_file.read(readcount + 128)
+                readpos = max(file_position - 1024, 0)
+                readcount = file_position - readpos
+                current_file.seek(readpos)
+                data = current_file.read(readcount + 128)
             except:
                 logging.exception("virtual_sdcard shutdown read")
                 return
             logging.info("Virtual sdcard (%d): %s\nUpcoming (%d): %s",
                          readpos, repr(data[:readcount]),
-                         self.file_position, repr(data[readcount:]))
+                         file_position, repr(data[readcount:]))
+        self.reactor.register_callback(log_debug_data)
+    def _handle_debuginput_exit(self):
+        # When in batch debugging mode, wait until sdcard idle before exiting
+        return self.work_timer is None
     def stats(self, eventtime):
         if self.work_timer is None:
             return False, ""
@@ -68,34 +80,54 @@ class VirtualSD:
         if check_subdirs:
             flist = []
             for root, dirs, files in os.walk(
-                    self.sdcard_dirname, followlinks=True):
+                    self.sdcard_dirname, followlinks=False):
                 for name in files:
                     ext = name[name.rfind('.')+1:]
                     if ext not in VALID_GCODE_EXTS:
                         continue
                     full_path = os.path.join(root, name)
-                    r_path = full_path[len(self.sdcard_dirname) + 1:]
-                    size = os.path.getsize(full_path)
-                    flist.append((r_path, size))
+                    safe_path = self._resolve_filename(full_path)
+                    if safe_path is None or not os.path.isfile(safe_path):
+                        continue
+                    r_path = os.path.relpath(full_path, self.sdcard_dirname)
+                    size = os.path.getsize(safe_path)
+                    mtime = os.path.getmtime(safe_path)
+                    flist.append((r_path, size, mtime))
             if sort_by_date:
-                return sorted(flist, key=lambda f: os.path.getmtime(
-                    os.path.join(self.sdcard_dirname, f[0])), reverse=True)
-            return sorted(flist, key=lambda f: f[0].lower())
+                flist.sort(key=lambda f: f[2], reverse=True)
+            else:
+                flist.sort(key=lambda f: f[0].lower())
+            return [(fname, size) for fname, size, mtime in flist]
         else:
             dname = self.sdcard_dirname
             try:
                 filenames = os.listdir(self.sdcard_dirname)
-                flist = [(fname, os.path.getsize(os.path.join(dname, fname)))
-                         for fname in filenames
-                         if not fname.startswith('.')
-                         and os.path.isfile((os.path.join(dname, fname)))]
+                flist = []
+                for fname in sorted(filenames, key=str.lower):
+                    if fname.startswith('.'):
+                        continue
+                    safe_path = self._resolve_filename(
+                        os.path.join(dname, fname))
+                    if safe_path is None or not os.path.isfile(safe_path):
+                        continue
+                    flist.append((fname, os.path.getsize(safe_path),
+                                  os.path.getmtime(safe_path)))
                 if sort_by_date:
-                    return sorted(flist, key=lambda f: os.path.getmtime(
-                        os.path.join(dname, f[0])), reverse=True)
-                return sorted(flist, key=lambda f: f[0].lower())
+                    flist.sort(key=lambda f: f[2], reverse=True)
+                else:
+                    flist.sort(key=lambda f: f[0].lower())
+                return [(fname, size) for fname, size, mtime in flist]
             except:
                 logging.exception("virtual_sdcard get_file_list")
                 raise self.gcode.error("Unable to get file list")
+    # Resolve symlinks and require files to remain under the virtual SD root
+    def _resolve_filename(self, filename):
+        candidate = os.path.realpath(filename)
+        root = self.sdcard_dirname
+        root_prefix = root if root.endswith(os.sep) else root + os.sep
+        if candidate == root or not candidate.startswith(root_prefix):
+            return None
+        return candidate
     def get_status(self, eventtime):
         return {
             'file_path': self.file_path(),
@@ -158,6 +190,8 @@ class VirtualSD:
             raise gcmd.error("SD busy")
         self._reset_file()
         filename = gcmd.get("FILENAME")
+        if not filename:
+            raise gcmd.error("Missing filename")
         if filename[0] == '/':
             filename = filename[1:]
         self._load_file(gcmd, filename, check_subdirs=True)
@@ -182,6 +216,8 @@ class VirtualSD:
             filename = filename[1:]
         self._load_file(gcmd, filename)
     def _load_file(self, gcmd, filename, check_subdirs=False):
+        if not filename:
+            raise gcmd.error("Missing filename")
         files = self.get_file_list(check_subdirs)
         flist = [f[0] for f in files]
         files_by_lower = { fname.lower(): fname for fname, fsize in files }
@@ -189,11 +225,17 @@ class VirtualSD:
         try:
             if fname not in flist:
                 fname = files_by_lower[fname.lower()]
-            fname = os.path.join(self.sdcard_dirname, fname)
-            f = io.open(fname, 'r', newline='')
+            fname = self._resolve_filename(
+                os.path.join(self.sdcard_dirname, fname))
+            if fname is None:
+                raise ValueError("File is outside virtual SD root")
+            f = self.executor.submit(io.open, fname, 'rb', buffering=0)
+            f = self.executor.wrap_obj(f)
+            f = io.BufferedReader(f)
             f.seek(0, os.SEEK_END)
             fsize = f.tell()
             f.seek(0)
+            f = io.TextIOWrapper(f, newline='')
         except:
             logging.exception("virtual_sdcard file open")
             raise gcmd.error("Unable to open file")
@@ -261,6 +303,15 @@ class VirtualSD:
                 lines = data.split('\n')
                 lines[0] = partial_input + lines[0]
                 partial_input = lines.pop()
+                if (len(partial_input) > self.gcode.MAX_COMMAND_LENGTH
+                    or any(len(line) > self.gcode.MAX_COMMAND_LENGTH
+                           for line in lines)):
+                    error_message = "G-Code command exceeds maximum length"
+                    try:
+                        self.gcode.run_script(self.on_error_gcode.render())
+                    except:
+                        logging.exception("virtual_sdcard on_error")
+                    break
                 lines.reverse()
                 self.reactor.pause(self.reactor.NOW)
                 continue

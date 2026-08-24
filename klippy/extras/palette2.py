@@ -6,6 +6,7 @@
 
 import logging
 import os
+import math
 import serial
 
 from serial import SerialException
@@ -380,6 +381,8 @@ class Palette2:
 
         if len(params) > 2:
             percent = float(params[1][1:])
+            if math.isnan(percent) or math.isinf(percent):
+                raise ValueError("non-finite percentage")
             if params[0] == "D1":
                 number = len(self.omega_pings) + 1
                 d = {"number": number, "percent": percent}

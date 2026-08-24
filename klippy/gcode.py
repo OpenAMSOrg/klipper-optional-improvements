@@ -3,7 +3,24 @@
 # Copyright (C) 2016-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, re, logging, collections, shlex, operator
+import os, re, logging, collections, shlex, operator, math
+
+# math.isfinite() is unavailable on Python 2.
+try:
+    isfinite = math.isfinite
+except AttributeError:
+    def isfinite(value):
+        return not (math.isnan(value) or math.isinf(value))
+
+# Prevent unbounded buffering of an unterminated input command
+MAX_COMMAND_LENGTH = 1024 * 1024
+
+def parse_float(value):
+    # Non-finite values bypass normal minval and maxval comparisons
+    value = float(value)
+    if not isfinite(value):
+        raise ValueError("non-finite value")
+    return value
 
 class CommandError(Exception):
     pass
@@ -92,13 +109,14 @@ class GCodeCommand:
         return self.get(name, default, parser=int, minval=minval, maxval=maxval)
     def get_float(self, name, default=sentinel, minval=None, maxval=None,
                   above=None, below=None):
-        return self.get(name, default, parser=float, minval=minval,
+        return self.get(name, default, parser=parse_float, minval=minval,
                         maxval=maxval, above=above, below=below)
 
 # Parse and dispatch G-Code commands
 class GCodeDispatch:
     error = CommandError
     Coord = Coord
+    MAX_COMMAND_LENGTH = MAX_COMMAND_LENGTH
     def __init__(self, printer):
         self.printer = printer
         self.is_fileinput = not not printer.get_start_args().get("debuginput")
@@ -198,9 +216,16 @@ class GCodeDispatch:
         self._build_status_commands()
         self._respond_state("Ready")
     # Parse input into commands
-    args_r = re.compile('([A-Z_]+|[A-Z*])')
+    args_r = re.compile('([A-Z_]+|[*])')
     def _process_commands(self, commands, need_ack=True):
         for line in commands:
+            if len(line) > MAX_COMMAND_LENGTH:
+                msg = "G-Code command exceeds maximum length"
+                self._respond_error(msg)
+                self.printer.send_event("gcode:command_error")
+                if not need_ack:
+                    raise self.error(msg)
+                continue
             # Ignore comments and leading/trailing spaces
             line = origline = line.strip()
             cpos = line.find(';')
@@ -208,11 +233,15 @@ class GCodeDispatch:
                 line = line[:cpos]
             # Break line into parts and determine command
             parts = self.args_r.split(line.upper())
-            if ''.join(parts[:2]) == 'N':
+            if len(parts) == 1:
+                cmd = parts[0].strip()
+            elif not parts[0] and parts[1] == 'N':
                 # Skip line number at start of command
                 cmd = ''.join(parts[3:5]).strip()
+            elif not parts[0]:
+                cmd = (parts[1] + parts[2]).strip()
             else:
-                cmd = ''.join(parts[:3]).strip()
+                cmd = (parts[0] + parts[1] + parts[2]).strip()
             # Build gcode "params" dictionary
             params = { parts[i]: parts[i+1].strip()
                        for i in range(1, len(parts), 2) }
@@ -404,6 +433,7 @@ class GCodeIO:
             self.fd_handle = self.reactor.register_fd(self.fd,
                                                       self._process_data)
         self.partial_input = ""
+        self.is_discarding_line = False
         self.pending_commands = []
         self.bytes_read = 0
         self.input_log = collections.deque([], 50)
@@ -429,6 +459,10 @@ class GCodeIO:
         self.is_printer_ready = False
         if self.is_fileinput:
             self.printer.request_exit('error_exit')
+    def _do_debuginput_exit(self):
+        while not all(self.printer.send_event('gcode:debuginput_exit')):
+            self.reactor.pause(self.reactor.monotonic() + 0.010)
+        self.gcode.request_restart('exit')
     m112_r = re.compile(r'^(?:[nN][0-9]+)?\s*[mM]112(?:\s|$)')
     def _process_data(self, eventtime):
         # Read input, separate by newline, and add to pending_commands
@@ -440,18 +474,37 @@ class GCodeIO:
         self.input_log.append((eventtime, data))
         self.bytes_read += len(data)
         lines = data.split('\n')
-        lines[0] = self.partial_input + lines[0]
-        self.partial_input = lines.pop()
+        if self.is_discarding_line:
+            if len(lines) == 1:
+                lines = []
+            else:
+                self.is_discarding_line = False
+                lines = lines[1:]
+        else:
+            lines[0] = self.partial_input + lines[0]
+        if lines:
+            self.partial_input = lines.pop()
+        else:
+            self.partial_input = ""
+        if len(self.partial_input) > MAX_COMMAND_LENGTH:
+            logging.warning("Discarding overlong G-Code command")
+            self.partial_input = ""
+            self.is_discarding_line = True
+        valid_lines = [line for line in lines
+                       if len(line) <= MAX_COMMAND_LENGTH]
+        if len(valid_lines) != len(lines):
+            logging.warning("Discarding overlong G-Code command")
+        lines = valid_lines
         pending_commands = self.pending_commands
         pending_commands.extend(lines)
         self.pipe_is_active = True
         # Special handling for debug file input EOF
         if not data and self.is_fileinput:
+            self.reactor.unregister_fd(self.fd_handle)
+            self.fd_handle = None
             if not self.is_processing_data:
-                self.reactor.unregister_fd(self.fd_handle)
-                self.fd_handle = None
-                self.gcode.request_restart('exit')
-            pending_commands.append("")
+                self._do_debuginput_exit()
+            return
         # Handle case where multiple commands pending
         if len(pending_commands) < 20:
             # Check for M112 out-of-order

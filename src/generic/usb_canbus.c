@@ -4,7 +4,7 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
-#include <string.h> // memmove
+#include <string.h> // memcpy
 #include "autoconf.h" // CONFIG_USB_VENDOR_ID
 #include "board/canbus.h" // canbus_notify_tx
 #include "board/canserial.h" // canserial_notify_tx
@@ -97,10 +97,27 @@ struct gs_host_frame {
     };
 } __packed;
 
+#define GS_CAN_SFF_MASK 0x000007ff
+#define GS_CAN_EFF_MASK 0x1fffffff
+#define GS_HOST_FRAME_ECHO_ID_RX 0xffffffff
+
+static int
+gs_can_id_is_valid(uint32_t id)
+{
+    uint32_t id_mask = (id & CANMSG_ID_EFF
+                        ? GS_CAN_EFF_MASK : GS_CAN_SFF_MASK);
+    uint32_t allowed = id_mask | CANMSG_ID_RTR;
+    if (id & CANMSG_ID_EFF)
+        allowed |= CANMSG_ID_EFF;
+    return !(id & ~allowed);
+}
+
 
 /****************************************************************
  * Main usbcan task (read requests from usb and send msgs to usb)
  ****************************************************************/
+
+static uint_fast8_t usbcan_stall_event(struct timer *timer);
 
 // Global storage
 static struct usbcan_data {
@@ -111,8 +128,9 @@ static struct usbcan_data {
     uint32_t assigned_id;
 
     // State tracking for messages to be sent from host to canbus
-    uint32_t bus_send_discard_time;
-    uint8_t bus_send_state;
+    struct timer bus_send_timer;
+    uint8_t bus_send_state, bus_send_timed_out;
+    uint32_t tx_discards, usb_invalid;
 
     // Canbus data from host
     uint8_t host_status;
@@ -120,9 +138,13 @@ static struct usbcan_data {
     struct gs_host_frame host_frames[16];
 
     // Data from physical canbus interface
+    // Single-producer IRQ ring; indexes publish ownership across contexts
     uint32_t canhw_pull_pos, canhw_push_pos;
+    uint32_t canhw_overflows;
     struct canbus_msg canhw_queue[32];
-} UsbCan;
+} UsbCan = {
+    .bus_send_timer.func = usbcan_stall_event,
+};
 
 enum {
     BSS_READY = 0, BSS_BLOCKING, BSS_DISCARDING
@@ -139,11 +161,24 @@ static int
 send_frame(struct canbus_msg *msg)
 {
     struct gs_host_frame gs = {};
-    gs.echo_id = 0xffffffff;
+    gs.echo_id = GS_HOST_FRAME_ECHO_ID_RX;
     gs.can_id = msg->id;
     gs.can_dlc = msg->dlc;
-    gs.data32[0] = msg->data32[0];
-    gs.data32[1] = msg->data32[1];
+    /*
+     * A canbus_msg always reserves eight data bytes, but bytes beyond its DLC
+     * are not part of the CAN frame and are not guaranteed to have been
+     * initialized.  Hardware receive mailboxes may retain old register data,
+     * and short locally generated messages may leave the unused stack bytes
+     * untouched.  The gs_usb record always exposes all eight byte positions to
+     * the host, so copying the complete storage would cross that stale data
+     * over the USB trust boundary.  Copy only bytes that the CAN DLC makes
+     * visible;
+     * the zero-initialized destination supplies deterministic padding.  Remote
+     * transmission requests have a DLC but no data field, hence their copy
+     * length is deliberately zero.
+     */
+    uint32_t len = msg->id & CANMSG_ID_RTR ? 0 : CANMSG_DATA_LEN(msg);
+    memcpy(gs.data, msg->data, len);
     return usb_send_bulk_in(&gs, sizeof(gs));
 }
 
@@ -166,7 +201,14 @@ drain_canhw_queue(void)
             UsbCan.usb_send_busy = 1;
             return;
         }
-        UsbCan.canhw_pull_pos = pull_pos = pull_pos + 1;
+        /*
+         * The CAN receive interrupt may reuse this slot after pull_pos changes.
+         * Publish returned capacity only after send_frame() has finished every
+         * read from the entry; the accessor supplies the compiler barrier for
+         * that task-to-interrupt ownership transfer.
+         */
+        pull_pos++;
+        writel(&UsbCan.canhw_pull_pos, pull_pos);
     }
 }
 
@@ -182,9 +224,81 @@ drain_usb_host_messages(void)
         uint32_t pushp = push_pos % ARRAY_SIZE(UsbCan.host_frames);
         struct gs_host_frame *gs = &UsbCan.host_frames[pushp];
         int ret = usb_read_bulk_out(gs, sizeof(*gs));
-        if (ret <= 0)
+        if (ret < 0)
             // No more messages ready
             break;
+        /*
+         * A successful endpoint read may still be shorter than the fixed
+         * gs_host_frame record.  This queue slot is reused, so publishing a
+         * short transfer would combine its new prefix with an old CAN id, DLC,
+         * or payload suffix and transmit data the host did not provide in this
+         * request.  Also reject a DLC larger than the eight bytes implemented
+         * by the classic-CAN record and by struct canbus_msg.  Consume
+         * malformed USB records but do not advance host_push_pos; the slot can
+         * then be overwritten by the next complete transfer without making
+         * partial state visible to the routing task.
+         */
+        if (ret != sizeof(*gs) || gs->can_dlc > sizeof(gs->data)) {
+            UsbCan.usb_invalid++;
+            continue;
+        }
+        /*
+         * device_config.icount advertises one CAN channel, so channel zero is
+         * the only value the gs_usb protocol permits for this interface.  The
+         * bridge echoes the host frame before routing it, including this field.
+         * Linux treats an echoed channel outside the advertised range as a
+         * broken device and detaches the CAN network interface.  Discard such
+         * a frame here so malformed USB output cannot be reflected back as an
+         * apparently fatal device response or be transmitted on the physical
+         * bus under a channel selector the firmware silently ignored.
+         */
+        if (gs->channel) {
+            UsbCan.usb_invalid++;
+            continue;
+        }
+        /*
+         * bt_const.feature is zero and this endpoint implements only the
+         * fixed-size classic CAN frame.  Consequently no gs_usb frame flag is
+         * valid on host output.  Echoing an unsupported flag is not harmless:
+         * for example, GS_CAN_FLAG_FD tells Linux to parse the echo using the
+         * much larger CAN-FD layout.  Linux then rejects this 20-byte classic
+         * frame as truncated and never completes the corresponding transmit
+         * context, eventually stopping the SocketCAN queue.  Reject the frame
+         * before echoing it so the format advertised during probe remains the
+         * format used for every bulk transfer.
+         */
+        if (gs->flags) {
+            UsbCan.usb_invalid++;
+            continue;
+        }
+        /*
+         * The routing code compares the complete can_id, but each hardware
+         * backend masks that value down to either 11 or 29 identifier bits
+         * when it creates the physical frame.  Without a canonical encoding,
+         * a value such as 0x800 without the extended-frame flag is routed as
+         * 0x800 inside the bridge but appears as standard identifier zero on
+         * the wire.  SocketCAN error and unknown flag bits are likewise not
+         * representable by the CAN transmit controllers and would be silently
+         * removed.  Reject those ambiguous encodings so local routing, the
+         * USB echo, and the physical bus all refer to the same CAN frame.
+         */
+        if (!gs_can_id_is_valid(gs->can_id)) {
+            UsbCan.usb_invalid++;
+            continue;
+        }
+        /*
+         * GS_HOST_FRAME_ECHO_ID_RX distinguishes a device-originated receive
+         * frame from the echo which completes a host transmit request.  If the
+         * host is allowed to supply that reserved value, reflecting the frame
+         * makes Linux inject its own transmission as bus input and skip the
+         * transmit-context completion.  Besides reporting false receive data,
+         * enough missing completions stop the SocketCAN transmit queue.  Only
+         * the device-to-host path may create the receive marker.
+         */
+        if (gs->echo_id == GS_HOST_FRAME_ECHO_ID_RX) {
+            UsbCan.usb_invalid++;
+            continue;
+        }
         UsbCan.host_push_pos = push_pos = push_pos + 1;
     }
 }
@@ -196,13 +310,29 @@ note_discard_state(uint32_t discard)
     sendf("usb_canbus_state discard=%u", discard);
 }
 
+// Wake the routing task when a blocked hardware transmit reaches its deadline
+static uint_fast8_t
+usbcan_stall_event(struct timer *timer)
+{
+    /*
+     * This callback runs from the timer interrupt and therefore must not route
+     * the frame or emit usb_canbus_state directly.  Publish only the expired
+     * condition and wake the normal task, which owns bus_send_state and all USB
+     * operations.  Keeping the callback this small also bounds timer-interrupt
+     * latency while CAN traffic and step generation are active together.
+     */
+    writeb(&UsbCan.bus_send_timed_out, 1);
+    sched_wake_task(&UsbCan.wake);
+    return SF_DONE;
+}
+
 // Check if canbus queue has gotten stuck
 static int
 check_need_discard(void)
 {
     if (UsbCan.bus_send_state != BSS_BLOCKING)
         return 0;
-    return timer_is_before(UsbCan.bus_send_discard_time, timer_read_time());
+    return readb(&UsbCan.bus_send_timed_out);
 }
 
 // Attempt to send a message on the canbus
@@ -212,9 +342,12 @@ try_canmsg_send(struct canbus_msg *msg)
     int ret = canhw_send(msg);
     if (ret >= 0) {
         // Success
+        if (UsbCan.bus_send_state == BSS_BLOCKING)
+            sched_del_timer(&UsbCan.bus_send_timer);
         if (UsbCan.bus_send_state == BSS_DISCARDING)
             note_discard_state(0);
         UsbCan.bus_send_state = BSS_READY;
+        writeb(&UsbCan.bus_send_timed_out, 0);
         return ret;
     }
 
@@ -224,13 +357,25 @@ try_canmsg_send(struct canbus_msg *msg)
         note_discard_state(1);
         UsbCan.bus_send_state = BSS_DISCARDING;
     }
-    if (UsbCan.bus_send_state == BSS_DISCARDING)
+    if (UsbCan.bus_send_state == BSS_DISCARDING) {
         // Queue is stalled - just discard the message
+        UsbCan.tx_discards++;
         return 0;
+    }
     if (UsbCan.bus_send_state == BSS_READY) {
-        // Just starting to block - setup stall detection after 50ms
+        /*
+         * A stored deadline alone can not guarantee progress: the routing task
+         * checks it only when woken, and a wedged controller may provide no
+         * transmit-completion interrupt to cause that wakeup.  Install a real
+         * scheduler timer so the 50ms policy is enforced even when the host is
+         * otherwise idle and the missing hardware notification is the reason
+         * this frame remains blocked.
+         */
         UsbCan.bus_send_state = BSS_BLOCKING;
-        UsbCan.bus_send_discard_time = timer_read_time() + timer_from_us(50000);
+        writeb(&UsbCan.bus_send_timed_out, 0);
+        UsbCan.bus_send_timer.waketime = (timer_read_time()
+                                          + timer_from_us(50000));
+        sched_add_timer(&UsbCan.bus_send_timer);
     }
     return ret;
 }
@@ -336,17 +481,29 @@ canbus_notify_tx(void)
 void
 canbus_process_data(struct canbus_msg *msg)
 {
+    canbus_normalize_msg(msg);
     // Add to admin command queue
     uint32_t pushp = UsbCan.canhw_push_pos;
-    if (pushp - UsbCan.canhw_pull_pos >= ARRAY_SIZE(UsbCan.canhw_queue))
+    uint32_t pullp = readl(&UsbCan.canhw_pull_pos);
+    if (pushp - pullp >= ARRAY_SIZE(UsbCan.canhw_queue)) {
         // No space - drop message
+        UsbCan.canhw_overflows++;
         return;
+    }
     if (UsbCan.assigned_id && (msg->id & ~1) == UsbCan.assigned_id)
         // Id reserved for local
         return;
     uint32_t pos = pushp % ARRAY_SIZE(UsbCan.canhw_queue);
     memcpy(&UsbCan.canhw_queue[pos], msg, sizeof(*msg));
-    UsbCan.canhw_push_pos = pushp + 1;
+    /*
+     * push_pos is the interrupt's publication record: once the task observes
+     * it, every byte in this slot must already be visible.  A barriered store
+     * records that ordering explicitly instead of relying on the following
+     * wake function to prevent compiler reordering.  This ring has one IRQ
+     * producer and one task consumer, so independent monotonic indexes retain
+     * lock-free operation and rollover-safe unsigned distance checks.
+     */
+    writel(&UsbCan.canhw_push_pos, pushp + 1);
     wake_usbcan_task();
 }
 
@@ -376,6 +533,24 @@ void
 canbus_set_filter(uint32_t id)
 {
     UsbCan.assigned_id = id;
+}
+
+void
+canbus_get_diagnostics(struct canbus_diagnostics *diag)
+{
+    struct canbus_status status;
+    memset(&status, 0, sizeof(status));
+    canhw_get_status(&status);
+    /*
+     * canhw_overflows is interrupt-owned; acquire it explicitly before adding
+     * the task-owned bridge counters.  All counters intentionally wrap at 32
+     * bits like existing CAN error statistics, allowing the host to extend them
+     * without adding synchronization or wide arithmetic to MCU hot paths.
+     */
+    diag->rx_overflows = status.rx_overflows + readl(&UsbCan.canhw_overflows);
+    diag->tx_discards = UsbCan.tx_discards;
+    diag->usb_invalid = UsbCan.usb_invalid;
+    diag->bus_off = status.bus_off;
 }
 
 
@@ -669,9 +844,42 @@ usb_req_set_configuration(struct usb_ctrlrequest *req)
 
 struct gs_host_config host_config;
 
+static int
+gs_validate_request(struct usb_ctrlrequest *req, uint_fast8_t direction,
+                    uint_fast16_t value, uint_fast16_t length)
+{
+    /*
+     * A USB control setup packet defines the direction and size of the data
+     * stage which follows it.  The handlers below use fixed C structures, so
+     * starting one of those transfers after accepting only bRequest can make
+     * the device and host disagree about which endpoint is sending and how
+     * many bytes remain.  In particular, accepting an IN request in an OUT
+     * handler can leave ep0 waiting for bytes that the host will never send,
+     * while accepting a short wLength can transfer beyond the host's stated
+     * buffer.  Either case can wedge the control endpoint until the USB
+     * connection is reset.
+     *
+     * The gs_usb requests implemented here all have one exact transfer shape.
+     * This implementation also advertises one interface containing one CAN
+     * channel, both numbered zero.  Validate all of those protocol invariants
+     * before installing any ep0 transfer state; a stall lets the USB host
+     * recover using the standard control-transfer error path.
+     */
+    uint_fast8_t request_type = direction | USB_TYPE_VENDOR
+        | USB_RECIP_INTERFACE;
+    if (req->bRequestType != request_type || req->wValue != value
+        || req->wIndex || req->wLength != length) {
+        usb_do_stall();
+        return -1;
+    }
+    return 0;
+}
+
 static void
 gs_breq_host_format(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_OUT, 1, sizeof(host_config)))
+        return;
     // Like candlightfw, little-endian is always used.  Read and ignore value.
     usb_do_xfer(&host_config, sizeof(host_config), UX_READ);
 }
@@ -684,6 +892,8 @@ static const struct gs_device_config device_config PROGMEM = {
 static void
 gs_breq_device_config(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_IN, 1, sizeof(device_config)))
+        return;
     usb_do_xfer((void*)&device_config, sizeof(device_config), UX_SEND);
 }
 
@@ -704,6 +914,8 @@ static const struct gs_device_bt_const bt_const PROGMEM = {
 static void
 gs_breq_bt_const(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_IN, 0, sizeof(bt_const)))
+        return;
     usb_do_xfer((void*)&bt_const, sizeof(bt_const), UX_SEND);
 }
 
@@ -712,6 +924,9 @@ struct gs_device_bittiming device_bittiming;
 static void
 gs_breq_bittiming(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_OUT, 0,
+                            sizeof(device_bittiming)))
+        return;
     // Bit timing is ignored for now
     usb_do_xfer(&device_bittiming, sizeof(device_bittiming), UX_READ);
 }
@@ -721,6 +936,8 @@ struct gs_device_mode device_mode;
 static void
 gs_breq_mode(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_OUT, 0, sizeof(device_mode)))
+        return;
     // Mode is ignored for now
     usb_do_xfer(&device_mode, sizeof(device_mode), UX_READ);
 }

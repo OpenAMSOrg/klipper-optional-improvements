@@ -77,6 +77,12 @@ report_errno(char *where, int rc)
 char *
 dump_string(char *outbuf, int outbuf_size, char *inbuf, int inbuf_size)
 {
+    if (!outbuf || outbuf_size <= 0)
+        return outbuf;
+    if (!inbuf || inbuf_size < 0 || outbuf_size < 5) {
+        outbuf[0] = '\0';
+        return outbuf;
+    }
     char *outend = &outbuf[outbuf_size-5], *o = outbuf;
     uint8_t *inend = (void*)&inbuf[inbuf_size], *p = (void*)inbuf;
     while (p < inend && o < outend) {
