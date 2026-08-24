@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, logging
+import util
 from . import heaters
 
 class PIDCalibrate:
@@ -137,7 +138,7 @@ class ControlAutoTune:
         pwm = ["pwm: %.3f %.3f" % (time, value)
                for time, value in self.pwm_samples]
         out = ["%.3f %.3f" % (time, temp) for time, temp in self.temp_samples]
-        f = open(filename, "w")
+        f = util.open_file_for_write(filename)
         f.write('\n'.join(pwm + out))
         f.close()
 

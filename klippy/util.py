@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, pty, fcntl, termios, signal, logging, json, time
+import sys, os, pty, fcntl, termios, signal, logging, json, time, errno, stat
 import subprocess, traceback, shlex
 
 
@@ -32,11 +32,18 @@ def clear_hupcl(fd):
 
 # Support for creating a pseudo-tty for emulating a serial port
 def create_pty(ptyname):
-    mfd, sfd = pty.openpty()
+    # Do not remove an arbitrary file at a user supplied path
     try:
+        path_stat = os.lstat(ptyname)
+        if (not stat.S_ISLNK(path_stat.st_mode)
+            or path_stat.st_uid != os.geteuid()):
+            raise RuntimeError("Refusing to delete unsafe PTY path '%s'"
+                               % (ptyname,))
         os.unlink(ptyname)
-    except os.error:
-        pass
+    except os.error as e:
+        if e.errno != errno.ENOENT:
+            raise
+    mfd, sfd = pty.openpty()
     filename = os.ttyname(sfd)
     os.chmod(filename, 0o660)
     os.symlink(filename, ptyname)
@@ -45,6 +52,26 @@ def create_pty(ptyname):
     old[3] = old[3] & ~termios.ECHO
     termios.tcsetattr(mfd, termios.TCSADRAIN, old)
     return mfd
+
+# Open diagnostic output only after confirming it is a safe regular file
+def open_file_for_write(filename):
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    flags |= getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(filename, flags, 0o600)
+    try:
+        file_stat = os.fstat(fd)
+        if (not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != os.geteuid() or file_stat.st_nlink != 1):
+            raise OSError(errno.EPERM, "Refusing unsafe output file",
+                          filename)
+        # Defer truncation until after validating the opened inode
+        os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
+        return os.fdopen(fd, 'w')
+    except:
+        os.close(fd)
+        raise
 
 
 ######################################################################

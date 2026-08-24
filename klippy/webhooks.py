@@ -3,7 +3,7 @@
 # Copyright (C) 2020 Eric Callahan <arksine.code@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license
-import logging, socket, os, sys, errno, collections, math
+import logging, socket, os, sys, errno, collections, stat, math
 import gcode
 
 try:
@@ -133,6 +133,7 @@ class ServerSocket:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.setblocking(0)
         self.sock.bind(server_address)
+        os.chmod(server_address, 0o660)
         self.sock.listen(1)
         self.fd_handle = self.reactor.register_fd(
             self.sock.fileno(), self._handle_accept)
@@ -166,13 +167,16 @@ class ServerSocket:
 
     def _remove_socket_file(self, file_path):
         try:
-            os.remove(file_path)
-        except OSError:
-            if os.path.exists(file_path):
-                logging.exception(
-                    "webhooks: Unable to delete socket file '%s'"
-                    % (file_path))
-                raise
+            path_stat = os.lstat(file_path)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                return
+            raise
+        if (not stat.S_ISSOCK(path_stat.st_mode)
+            or path_stat.st_uid != os.geteuid()):
+            raise RuntimeError(
+                "Refusing to delete unsafe API path '%s'" % (file_path,))
+        os.remove(file_path)
 
     def pop_client(self, client_id):
         self.clients.pop(client_id, None)
