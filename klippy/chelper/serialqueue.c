@@ -433,6 +433,22 @@ do_write(struct serialqueue *sq, void *buf, int buflen)
         cf.can_dlc = size;
         memcpy(cf.data, data, size);
         int ret = write(sq->serial_fd, &cf, sizeof(cf));
+        /*
+         * A SocketCAN raw socket is record-oriented: success is exactly one
+         * complete struct can_frame, not a byte count that may be resumed with
+         * another write.  Advancing after a short positive result would drop
+         * the unsent suffix of this Klipper stream fragment, while writing that
+         * suffix separately would create a second and semantically different
+         * CAN frame.  The protocol retransmit machinery can recover after the
+         * connection is stopped, but it can not infer this silent boundary
+         * loss, so treat any short result as a fatal transport invariant
+         * violation.  Negative results retain the existing timed retry path.
+         */
+        if (ret >= 0 && ret != sizeof(cf)) {
+            errorf("Incomplete CAN frame write (size=%d)", ret);
+            pollreactor_do_exit(sq->pr);
+            return;
+        }
         if (ret < 0) {
             report_errno("can write", ret);
             double curtime = get_monotonic();
