@@ -334,7 +334,19 @@ canserial_process_data(struct canbus_msg *msg)
                || (CanData.assigned_id && id == CanData.assigned_id + 1)) {
         // Add to admin command queue
         uint32_t pushp = CanData.admin_push_pos;
-        if (pushp >= CanData.admin_pull_pos + ARRAY_SIZE(CanData.admin_queue))
+        /*
+         * The queue positions are monotonically increasing uint32_t counters,
+         * so they necessarily wrap on a sufficiently busy or long-lived bus.
+         * Adding the queue depth to admin_pull_pos before comparing can wrap
+         * that right-hand side first.  Near UINT32_MAX an empty queue would
+         * then appear full; because the producer stops advancing when full,
+         * admin reception could remain wedged permanently.  Unsigned
+         * subtraction preserves the small producer-consumer distance across
+         * rollover, which is safe because that distance is bounded by this
+         * eight-entry queue.
+         */
+        if (pushp - CanData.admin_pull_pos
+            >= ARRAY_SIZE(CanData.admin_queue))
             // No space - drop message
             return;
         uint32_t pos = pushp % ARRAY_SIZE(CanData.admin_queue);
