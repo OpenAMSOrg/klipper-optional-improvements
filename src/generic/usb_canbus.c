@@ -223,6 +223,19 @@ drain_usb_host_messages(void)
          */
         if (gs->channel)
             continue;
+        /*
+         * bt_const.feature is zero and this endpoint implements only the
+         * fixed-size classic CAN frame.  Consequently no gs_usb frame flag is
+         * valid on host output.  Echoing an unsupported flag is not harmless:
+         * for example, GS_CAN_FLAG_FD tells Linux to parse the echo using the
+         * much larger CAN-FD layout.  Linux then rejects this 20-byte classic
+         * frame as truncated and never completes the corresponding transmit
+         * context, eventually stopping the SocketCAN queue.  Reject the frame
+         * before echoing it so the format advertised during probe remains the
+         * format used for every bulk transfer.
+         */
+        if (gs->flags)
+            continue;
         UsbCan.host_push_pos = push_pos = push_pos + 1;
     }
 }
