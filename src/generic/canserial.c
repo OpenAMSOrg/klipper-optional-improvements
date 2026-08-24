@@ -19,6 +19,9 @@
 
 #define CANBUS_UUID_LEN 6
 
+#define CAN_QUERY_RESPONSE_BITS 160
+#define CAN_QUERY_RESPONSE_WINDOW_US 1500000
+
 enum {
     CQS_IDLE, CQS_WAITING, CQS_READY
 };
@@ -210,11 +213,32 @@ can_process_query_unassigned(struct canbus_msg *msg)
 {
     if (CanData.assigned_id || CanData.query_state != CQS_IDLE)
         return;
-    // Spread responses over 1.5 seconds to avoid same-id collisions
-    uint32_t slot = CanData.uuid[0] | CanData.uuid[1] << 8;
+    /*
+     * Every discovery response uses CANBUS_ID_ADMIN_RESP.  CAN arbitration can
+     * therefore not select a winner when multiple responses become ready at
+     * the same bus-idle boundary; the controllers continue into the different
+     * UUID payloads and produce a data-bit collision instead.  A timer spacing
+     * shorter than one complete response does not prevent that condition,
+     * because every timer which expires while an earlier frame owns the bus
+     * becomes a simultaneous contender as soon as that frame finishes.
+     *
+     * Reserve 160 bit times per slot.  An eight-byte standard CAN data frame,
+     * including worst-case bit stuffing, acknowledgement, end-of-frame, and
+     * inter-frame spacing, fits within that conservative bound.  Scaling the
+     * slot duration by the configured bitrate makes the protection valid below
+     * the usual 1Mbit/s setting as well.  The fixed response window bounds
+     * discovery latency; at least one slot is retained for unusually low
+     * build-time bitrate settings.
+     */
+    uint32_t slot_us = DIV_ROUND_UP(CAN_QUERY_RESPONSE_BITS * 1000000u,
+                                    CONFIG_CANBUS_FREQUENCY);
+    uint32_t slot_count = CAN_QUERY_RESPONSE_WINDOW_US / slot_us;
+    if (!slot_count)
+        slot_count = 1;
+    uint32_t uuid_slot = CanData.uuid[0] | CanData.uuid[1] << 8;
+    uint32_t delay = 100 + uuid_slot % slot_count * slot_us;
     CanData.query_state = CQS_WAITING;
-    CanData.query_timer.waketime = (timer_read_time()
-                                    + timer_from_us(100 + slot * 23));
+    CanData.query_timer.waketime = timer_read_time() + timer_from_us(delay);
     sched_add_timer(&CanData.query_timer);
 }
 

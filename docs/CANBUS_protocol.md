@@ -36,7 +36,9 @@ assigned a `canbus_nodeid`. Unassigned micro-controllers will respond
 with a RESP_NEED_NODEID response message. Klipper micro-controllers
 delay that response by an interval derived from their `canbus_uuid` so
 that multiple unassigned nodes do not normally transmit the response
-with the same CAN bus id at the same time.
+with the same CAN bus id at the same time. Response slots are separated
+by enough time to transmit the complete response at the configured CAN
+bus frequency.
 
 The CMD_QUERY_UNASSIGNED message format is:
 `<1-byte message_id = 0x00>`
