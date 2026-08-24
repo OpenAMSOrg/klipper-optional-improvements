@@ -97,6 +97,14 @@ defs_trapq = """
         double x_r, y_r, z_r;
     };
 
+    struct trapq_append_move {
+        double print_time;
+        double accel_t, cruise_t, decel_t;
+        double start_pos_x, start_pos_y, start_pos_z;
+        double axes_r_x, axes_r_y, axes_r_z;
+        double start_v, cruise_v, accel;
+    };
+
     struct trapq *trapq_alloc(void);
     void trapq_free(struct trapq *tq);
     void trapq_append(struct trapq *tq, double print_time
@@ -104,6 +112,8 @@ defs_trapq = """
         , double start_pos_x, double start_pos_y, double start_pos_z
         , double axes_r_x, double axes_r_y, double axes_r_z
         , double start_v, double cruise_v, double accel);
+    void trapq_append_batch(struct trapq *tq
+        , const struct trapq_append_move *moves, int move_count);
     void trapq_finalize_moves(struct trapq *tq, double print_time
         , double clear_history_time);
     void trapq_set_position(struct trapq *tq, double print_time

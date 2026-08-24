@@ -222,6 +222,7 @@ class LookAheadQueue:
 BUFFER_TIME_HIGH = 1.0
 BUFFER_TIME_START = 0.250
 PRIMING_CMD_TIME = 0.100
+TRAPQ_BATCH_SIZE = 64
 
 # Main code to track events (and their timing) on the printer toolhead
 class ToolHead:
@@ -259,6 +260,7 @@ class ToolHead:
                                                     can_add_trapq=True)
         self.trapq = self.motion_queuing.allocate_trapq()
         self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        self.trapq_append_moves = self.motion_queuing.append_trapq_moves
         # Create kinematics class
         gcode = self.printer.lookup_object('gcode')
         self.Coord = gcode.Coord
@@ -305,22 +307,43 @@ class ToolHead:
             self._calc_print_time()
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
+        trapq_moves = []
+        # Primary and extra-axis trapqs remain private until step generation
+        # begins after this loop.  It is therefore safe for an extra axis to
+        # append its record while primary records are still in this host batch;
+        # no consumer can observe their temporary insertion order.  Timing
+        # callbacks are the one Python-visible boundary and explicitly flush
+        # the batch below before they run.
         with self.reactor.assert_no_pause():
             for move in moves:
                 if move.is_kinematic_move:
-                    self.trapq_append(
-                        self.trapq, next_move_time,
+                    # Store the exact trapq_append argument order so CFFI can
+                    # convert a contiguous group once.  Keep batches bounded:
+                    # tiny segmented paths can place many moves in lookahead,
+                    # and saving foreign calls must not create an unbounded
+                    # second copy of that queue.  Sixty-four records require
+                    # less than 7KiB while amortizing nearly all call overhead.
+                    trapq_moves.append((
+                        next_move_time,
                         move.accel_t, move.cruise_t, move.decel_t,
                         move.start_pos[0], move.start_pos[1], move.start_pos[2],
                         move.axes_r[0], move.axes_r[1], move.axes_r[2],
-                        move.start_v, move.cruise_v, move.accel)
+                        move.start_v, move.cruise_v, move.accel))
                 for e_index, ea in enumerate(self.extra_axes):
                     if move.axes_d[e_index + 3]:
                         ea.process_move(next_move_time, move, e_index + 3)
                 next_move_time = (next_move_time + move.accel_t
                                   + move.cruise_t + move.decel_t)
+                # A timing callback may inspect motion state.  Flush every
+                # primary-axis record through this move before invoking it,
+                # preserving the former append-before-callback guarantee.
+                if (len(trapq_moves) >= TRAPQ_BATCH_SIZE
+                    or move.timing_callbacks):
+                    self.trapq_append_moves(self.trapq, trapq_moves)
+                    trapq_moves = []
                 for cb in move.timing_callbacks:
                     cb(next_move_time)
+            self.trapq_append_moves(self.trapq, trapq_moves)
         # Generate steps for moves
         self._advance_move_time(next_move_time)
         self.motion_queuing.note_mcu_movequeue_activity(next_move_time)
