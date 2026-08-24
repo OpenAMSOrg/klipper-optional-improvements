@@ -12,6 +12,7 @@
 // clock times, prioritizes commands, and handles retransmissions.  A
 // background thread is launched to do this work and minimize latency.
 
+#define _GNU_SOURCE // recvmmsg
 #include <linux/can.h> // // struct can_frame
 #include <math.h> // fabs
 #include <pthread.h> // pthread_mutex_lock
@@ -20,7 +21,9 @@
 #include <stdio.h> // snprintf
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#include <sys/socket.h> // recvmmsg
 #include <termios.h> // tcflush
+#include <time.h> // clock_gettime
 #include <unistd.h> // pipe
 #include "compiler.h" // __visible
 #include "list.h" // list_add_tail
@@ -114,6 +117,8 @@ struct serialqueue {
 
 #define DEBUG_QUEUE_SENT 100
 #define DEBUG_QUEUE_RECEIVE 100
+
+#define CAN_RX_BATCH 16
 
 // Create a series of empty messages and add them to a list
 static void
@@ -326,11 +331,10 @@ handle_message(struct serialqueue *sq, double eventtime, double receive_time
 
 // Process complete frames and retain any incomplete trailing data
 static void
-process_input(struct serialqueue *sq, double eventtime)
+process_input(struct serialqueue *sq, double eventtime, double receive_time)
 {
     // Walk each complete frame in place and compact the buffer only once
     int consumed = 0, invalid = 0;
-    double receive_time = 0.;
     for (;;) {
         const uint8_t *msg = &sq->input_buf[consumed];
         int available = sq->input_pos - consumed;
@@ -338,7 +342,7 @@ process_input(struct serialqueue *sq, double eventtime)
         if (!msg_len)
             break;
         if (msg_len > 0) {
-            // Timestamp after read(), once for all messages in this batch
+            // Timestamp after read() when the transport supplied no timestamp
             if (msg_len > MESSAGE_MIN && !receive_time)
                 receive_time = get_monotonic();
             handle_message(sq, eventtime, receive_time, msg, msg_len);
@@ -359,32 +363,116 @@ process_input(struct serialqueue *sq, double eventtime)
         memmove(sq->input_buf, &sq->input_buf[consumed], sq->input_pos);
 }
 
+// Find the kernel receive time in a SocketCAN message
+static double
+can_get_receive_time(struct msghdr *msg, double realtime_to_monotonic
+                     , double fallback_time, int have_clock_offset)
+{
+    if (!have_clock_offset || (msg->msg_flags & MSG_CTRUNC))
+        return fallback_time;
+    struct cmsghdr *cmsg;
+    for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_TIMESTAMPNS
+            || cmsg->cmsg_len < CMSG_LEN(sizeof(struct timespec)))
+            continue;
+        struct timespec ts;
+        memcpy(&ts, CMSG_DATA(cmsg), sizeof(ts));
+        if (ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
+            return fallback_time;
+        double realtime = (double)ts.tv_sec + (double)ts.tv_nsec * .000000001;
+        return realtime + realtime_to_monotonic;
+    }
+    return fallback_time;
+}
+
+// Read a bounded batch of complete SocketCAN records
+static void
+can_input_event(struct serialqueue *sq, double eventtime)
+{
+    struct can_frame frames[CAN_RX_BATCH];
+    struct iovec iov[CAN_RX_BATCH];
+    struct mmsghdr msgs[CAN_RX_BATCH];
+    union {
+        struct cmsghdr align;
+        char data[CMSG_SPACE(sizeof(struct timespec))];
+    } control[CAN_RX_BATCH];
+    memset(msgs, 0, sizeof(msgs));
+    int i;
+    for (i=0; i<CAN_RX_BATCH; i++) {
+        iov[i].iov_base = &frames[i];
+        iov[i].iov_len = sizeof(frames[i]);
+        msgs[i].msg_hdr.msg_iov = &iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_control = control[i].data;
+        msgs[i].msg_hdr.msg_controllen = sizeof(control[i].data);
+    }
+
+    /*
+     * A raw CAN socket is record-oriented, but the old input path consumed only
+     * one record for each poll callback.  A burst therefore required another
+     * poll-reactor pass, timer scan, and read syscall per CAN frame even though
+     * the socket already held the complete batch.  recvmmsg() preserves record
+     * boundaries while amortizing those transitions.  Bound the batch so a
+     * busy CAN interface can not starve command scheduling in this thread.
+     */
+    int count = recvmmsg(sq->serial_fd, msgs, ARRAY_SIZE(msgs), MSG_DONTWAIT,
+                         NULL);
+    if (count < 0) {
+        report_errno("can read", count);
+        pollreactor_do_exit(sq->pr);
+        return;
+    }
+
+    /*
+     * python-can enables nanosecond software timestamps before handing this
+     * socket to serialqueue.  Those timestamps use CLOCK_REALTIME, whereas all
+     * Klipper scheduling uses CLOCK_MONOTONIC_RAW.  Sample both clocks once for
+     * this batch and translate each kernel timestamp into the scheduler's time
+     * domain.  Falling back to the post-read monotonic time retains the prior
+     * behavior if an older SocketCAN implementation supplies no control data.
+     */
+    struct timespec realtime_now;
+    int have_clock_offset = !clock_gettime(CLOCK_REALTIME, &realtime_now);
+    double fallback_time = get_monotonic(), realtime_to_monotonic = 0.;
+    if (have_clock_offset) {
+        double realtime = ((double)realtime_now.tv_sec
+                           + (double)realtime_now.tv_nsec * .000000001);
+        realtime_to_monotonic = fallback_time - realtime;
+    }
+
+    for (i=0; i<count; i++) {
+        if (msgs[i].msg_len != sizeof(frames[i])
+            || (msgs[i].msg_hdr.msg_flags & MSG_TRUNC)) {
+            errorf("Got incomplete CAN frame (size=%u)", msgs[i].msg_len);
+            pollreactor_do_exit(sq->pr);
+            return;
+        }
+        struct can_frame *cf = &frames[i];
+        if (cf->can_dlc > CAN_MAX_DLEN
+            || cf->can_dlc > sizeof(sq->input_buf) - sq->input_pos) {
+            errorf("Got invalid CAN frame length: %d", cf->can_dlc);
+            pollreactor_do_exit(sq->pr);
+            return;
+        }
+        if (cf->can_id != sq->client_id + 1)
+            continue;
+        memcpy(&sq->input_buf[sq->input_pos], cf->data, cf->can_dlc);
+        sq->input_pos += cf->can_dlc;
+        double receive_time = can_get_receive_time(
+            &msgs[i].msg_hdr, realtime_to_monotonic, fallback_time,
+            have_clock_offset);
+        // Process now so a completed block retains its final frame's timestamp
+        process_input(sq, eventtime, receive_time);
+    }
+}
+
 // Callback for input activity on the serial fd
 static void
 input_event(struct serialqueue *sq, double eventtime)
 {
     if (sq->serial_fd_type == SQT_CAN) {
-        struct can_frame cf;
-        // Require one complete kernel CAN frame per read
-        int ret = read(sq->serial_fd, &cf, sizeof(cf));
-        if (ret != sizeof(cf)) {
-            if (ret >= 0)
-                errorf("Got incomplete CAN frame (size=%d)", ret);
-            else
-                report_errno("can read", ret);
-            pollreactor_do_exit(sq->pr);
-            return;
-        }
-        if (cf.can_dlc > CAN_MAX_DLEN
-            || cf.can_dlc > sizeof(sq->input_buf) - sq->input_pos) {
-            errorf("Got invalid CAN frame length: %d", cf.can_dlc);
-            pollreactor_do_exit(sq->pr);
-            return;
-        }
-        if (cf.can_id != sq->client_id + 1)
-            return;
-        memcpy(&sq->input_buf[sq->input_pos], cf.data, cf.can_dlc);
-        sq->input_pos += cf.can_dlc;
+        can_input_event(sq, eventtime);
+        return;
     } else {
         int ret = read(sq->serial_fd, &sq->input_buf[sq->input_pos]
                        , sizeof(sq->input_buf) - sq->input_pos);
@@ -398,7 +486,7 @@ input_event(struct serialqueue *sq, double eventtime)
         }
         sq->input_pos += ret;
     }
-    process_input(sq, eventtime);
+    process_input(sq, eventtime, 0.);
 }
 
 // Callback for input activity on the pipe fd (wakes command_event)
