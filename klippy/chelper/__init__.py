@@ -317,8 +317,7 @@ def get_ffi():
         destlib = check_build_c_library()
         # Open library
         FFI_main = cffi.FFI()
-        for d in defs_all:
-            FFI_main.cdef(d)
+        FFI_main.cdef('\n'.join(defs_all))
         FFI_lib = FFI_main.dlopen(destlib)
         # Setup error logging
         pyhelper_logging_callback = FFI_main.callback("void func(const char *)",
