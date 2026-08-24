@@ -216,7 +216,7 @@ class GCodeDispatch:
         self._build_status_commands()
         self._respond_state("Ready")
     # Parse input into commands
-    args_r = re.compile('([A-Z_]+|[A-Z*])')
+    args_r = re.compile('([A-Z_]+|[*])')
     def _process_commands(self, commands, need_ack=True):
         for line in commands:
             if len(line) > MAX_COMMAND_LENGTH:
@@ -233,11 +233,15 @@ class GCodeDispatch:
                 line = line[:cpos]
             # Break line into parts and determine command
             parts = self.args_r.split(line.upper())
-            if ''.join(parts[:2]) == 'N':
+            if len(parts) == 1:
+                cmd = parts[0].strip()
+            elif not parts[0] and parts[1] == 'N':
                 # Skip line number at start of command
                 cmd = ''.join(parts[3:5]).strip()
+            elif not parts[0]:
+                cmd = (parts[1] + parts[2]).strip()
             else:
-                cmd = ''.join(parts[:3]).strip()
+                cmd = (parts[0] + parts[1] + parts[2]).strip()
             # Build gcode "params" dictionary
             params = { parts[i]: parts[i+1].strip()
                        for i in range(1, len(parts), 2) }
