@@ -87,9 +87,31 @@ int
 canhw_send(struct canbus_msg *msg)
 {
     uint32_t txfqs = CANx->MCAN_TXFQS;
-    if (txfqs & MCAN_TXFQS_TFQF)
-        // No space in transmit fifo - wait for irq
-        return -1;
+    if (txfqs & MCAN_TXFQS_TFQF) {
+        /*
+         * A completion interrupt is useful only after software has found the
+         * FIFO full and needs a future capacity notification.  Leaving it
+         * enabled continuously interrupts and wakes the cooperative scheduler
+         * after every frame, including the common case where no message is
+         * waiting.  Arm it on demand while interrupts are masked, then re-read
+         * TFQF so a completion between the first check and the IE write can not
+         * become a lost wakeup.  Clear stale completion flags before arming;
+         * otherwise an old successful send could cause an immediate wake while
+         * the FIFO holding the current burst is still full.
+         */
+        irqstatus_t flag = irq_save();
+        CANx->MCAN_IR = FDCAN_IE_TC;
+        CANx->MCAN_IE |= FDCAN_IE_TC;
+        barrier();
+        txfqs = CANx->MCAN_TXFQS;
+        if (txfqs & MCAN_TXFQS_TFQF) {
+            irq_restore(flag);
+            return -1;
+        }
+        // Capacity already returned; this call can fill it without a wakeup.
+        CANx->MCAN_IE &= ~FDCAN_IE_TC;
+        irq_restore(flag);
+    }
 
     uint32_t w_index = ((txfqs & MCAN_TXFQS_TFQPI_Msk) >> MCAN_TXFQS_TFQPI_Pos);
     struct fdcan_fifo *txfifo = &MSG_RAM.TXFIFO[w_index];
@@ -238,9 +260,19 @@ CAN_IRQHandler(void)
         }
     }
     if (ir & FDCAN_IE_TC) {
-        // Tx
+        /*
+         * IR records completions even while their interrupt sources are
+         * masked, so a receive interrupt can observe and clear an unrelated
+         * transmit flag.  Notify only if canhw_send() actually armed the source
+         * while waiting for capacity.  Mask it before waking the task so one
+         * completion releases one waiter instead of restoring per-frame IRQs.
+         */
+        uint32_t tx_ie = CANx->MCAN_IE & FDCAN_IE_TC;
         CANx->MCAN_IR = FDCAN_IE_TC;
-        canbus_notify_tx();
+        if (tx_ie) {
+            CANx->MCAN_IE &= ~FDCAN_IE_TC;
+            canbus_notify_tx();
+        }
     }
     if (ir & MCAN_IR_BO) {
         /*
@@ -387,7 +419,7 @@ can_init(void)
     /*##-3- Configure Interrupts #################################*/
     armcm_enable_irq(CAN_IRQHandler, CANx_IRQn, 1);
     CANx->MCAN_ILE = MCAN_ILE_EINT0;
-    CANx->MCAN_IE = (MCAN_IE_RF0NE | FDCAN_IE_TC | MCAN_IE_BOE
+    CANx->MCAN_IE = (MCAN_IE_RF0NE | MCAN_IE_BOE
                      | MCAN_IE_PEDE | MCAN_IE_PEAE);
 }
 DECL_INIT(can_init);
