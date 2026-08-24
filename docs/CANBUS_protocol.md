@@ -57,6 +57,21 @@ The CMD_SET_KLIPPER_NODEID message format is:
 The RESP_NEED_NODEID message format is:
 `<1-byte message_id = 0x20><6-byte canbus_uuid><1-byte set_klipper_nodeid = 0x01>`
 
+### CMD_REQUEST_BOOTLOADER message
+
+This command asks the micro-controller with a given `canbus_uuid` to
+enter its bootloader. It is accepted only by firmware builds that
+support a bootloader request. The command may be sent before a nodeid
+has been assigned because, like the other admin commands, it uses the
+broadcast CAN bus id `0x3f0` and selects its destination by UUID.
+
+The CMD_REQUEST_BOOTLOADER message format is:
+`<1-byte message_id = 0x02><6-byte canbus_uuid>`
+
+The `canbus_uuid` selects the target but does not authenticate the
+sender. See [Bootloader Entry](Bootloader_Entry.md) for the supported
+bootloader transition mechanisms.
+
 ## Data Packets
 
 A micro-controller that has been assigned a nodeid via the
