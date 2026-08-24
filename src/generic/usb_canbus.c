@@ -97,6 +97,20 @@ struct gs_host_frame {
     };
 } __packed;
 
+#define GS_CAN_SFF_MASK 0x000007ff
+#define GS_CAN_EFF_MASK 0x1fffffff
+
+static int
+gs_can_id_is_valid(uint32_t id)
+{
+    uint32_t id_mask = (id & CANMSG_ID_EFF
+                        ? GS_CAN_EFF_MASK : GS_CAN_SFF_MASK);
+    uint32_t allowed = id_mask | CANMSG_ID_RTR;
+    if (id & CANMSG_ID_EFF)
+        allowed |= CANMSG_ID_EFF;
+    return !(id & ~allowed);
+}
+
 
 /****************************************************************
  * Main usbcan task (read requests from usb and send msgs to usb)
@@ -235,6 +249,19 @@ drain_usb_host_messages(void)
          * format used for every bulk transfer.
          */
         if (gs->flags)
+            continue;
+        /*
+         * The routing code compares the complete can_id, but each hardware
+         * backend masks that value down to either 11 or 29 identifier bits
+         * when it creates the physical frame.  Without a canonical encoding,
+         * a value such as 0x800 without the extended-frame flag is routed as
+         * 0x800 inside the bridge but appears as standard identifier zero on
+         * the wire.  SocketCAN error and unknown flag bits are likewise not
+         * representable by the CAN transmit controllers and would be silently
+         * removed.  Reject those ambiguous encodings so local routing, the
+         * USB echo, and the physical bus all refer to the same CAN frame.
+         */
+        if (!gs_can_id_is_valid(gs->can_id))
             continue;
         UsbCan.host_push_pos = push_pos = push_pos + 1;
     }
