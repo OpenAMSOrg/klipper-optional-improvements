@@ -3,7 +3,7 @@
 # Copyright (C) 2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging
+import logging, zlib
 
 class PrinterCANBusStats:
     def __init__(self, config):
@@ -14,6 +14,16 @@ class PrinterCANBusStats:
         self.get_canbus_status_cmd = None
         self.status = {'rx_error': None, 'tx_error': None, 'tx_retries': None,
                        'bus_state': None}
+        # Every canbus_stats object is registered during the same connection
+        # phase.  If each first callback returns monotonic()+1, all later status
+        # commands remain phase-locked and create a periodic request/response
+        # burst across every CAN MCU.  Keep the initial query immediate so
+        # status remains available promptly, then use a stable MCU-name hash to
+        # add a one-time sub-second phase offset.  Subsequent callbacks retain
+        # the existing one-second period, but their CAN traffic no longer
+        # competes at the same bus-idle boundary on every cycle.
+        name_crc = zlib.crc32(self.name.encode('utf-8')) & 0xffffffff
+        self.query_phase = (name_crc & 0xffff) / 65536.
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
         self.printer.register_event_handler("klippy:shutdown",
@@ -67,7 +77,11 @@ class PrinterCANBusStats:
         state = params['canbus_bus_state']
         self.status = {'rx_error': rx, 'tx_error': tx, 'tx_retries': retries,
                        'bus_state': state}
-        return self.reactor.monotonic() + 1.
+        waketime = self.reactor.monotonic() + 1.
+        if self.query_phase is not None:
+            waketime += self.query_phase
+            self.query_phase = None
+        return waketime
     def stats(self, eventtime):
         status = self.status
         if status['rx_error'] is None:
