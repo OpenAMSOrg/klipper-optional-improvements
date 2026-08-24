@@ -21,6 +21,7 @@
 
 #define CAN_QUERY_RESPONSE_BITS 160
 #define CAN_QUERY_RESPONSE_WINDOW_US 1500000
+#define CAN_RX_COMMAND_BATCH 8
 
 enum {
     CQS_IDLE, CQS_WAITING, CQS_READY
@@ -393,7 +394,6 @@ console_pop_input(int len)
             memmove(&CanData.receive_buf[copied]
                     , &CanData.receive_buf[copied + len], needcopy - copied);
             copied = needcopy;
-            canserial_notify_rx();
         }
         irqstatus_t flag = irq_save();
         if (rpos != readb(&CanData.receive_pos)) {
@@ -433,16 +433,37 @@ canserial_rx_task(void)
         CanData.admin_pull_pos = pullp + 1;
     }
 
-    // Check for a complete message block and process it
-    uint_fast8_t rpos = readb(&CanData.receive_pos), pop_count;
-    int ret = command_find_block(CanData.receive_buf, rpos, &pop_count);
-    if (ret > 0)
-        command_dispatch(CanData.receive_buf, pop_count);
-    if (ret) {
+    /*
+     * A Klipper command block commonly spans several eight-byte CAN frames,
+     * and a SocketCAN sender can place several complete blocks on the bus in
+     * one scheduling interval.  Processing only the first block made every
+     * already-buffered successor wait for another scheduler pass.
+     *
+     * Dispatch a bounded group in one task invocation.  Remove each block
+     * before invoking the next command so the interrupt regains receive-buffer
+     * capacity promptly; console_pop_input() retains its interrupt-protected
+     * retry if a CAN frame arrives during compaction.  The task itself now owns
+     * the decision to continue, so compaction no longer schedules a redundant
+     * future pass merely because bytes remain.  Acknowledgements remain per
+     * protocol block and in sequence.  Bound the group so command input can not
+     * monopolize a cooperative scheduler pass when other MCU tasks are ready.
+     */
+    uint_fast8_t command_count;
+    for (command_count = 0; command_count < CAN_RX_COMMAND_BATCH;
+         command_count++) {
+        uint_fast8_t rpos = readb(&CanData.receive_pos), pop_count;
+        int ret = command_find_block(CanData.receive_buf, rpos, &pop_count);
+        if (!ret)
+            break;
+        if (ret > 0)
+            command_dispatch(CanData.receive_buf, pop_count);
         console_pop_input(pop_count);
         if (ret > 0)
             command_send_ack();
     }
+    if (command_count == CAN_RX_COMMAND_BATCH
+        && readb(&CanData.receive_pos))
+        canserial_notify_rx();
 }
 DECL_TASK(canserial_rx_task);
 
