@@ -10,6 +10,7 @@ class PrinterCANBus:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.ids = {}
+        self.next_nodeids = {}
     def add_uuid(self, config, canbus_uuid, canbus_iface):
         # The administration protocol carries a UUID as exactly six bytes;
         # configuration text is only a human-readable spelling of that number.
@@ -25,17 +26,26 @@ class PrinterCANBus:
             uuid = -1
         if uuid < 0 or uuid > 0xffffffffffff:
             raise config.error("Invalid canbus_uuid")
-        if uuid in self.ids:
+        # A node id becomes an arbitration id only on its selected CAN
+        # interface; it has no process-wide meaning.  Two isolated buses may
+        # legitimately contain the same factory UUID, and both should begin
+        # allocation at NODEID_FIRST instead of consuming one global sequence.
+        # Include the interface in the identity key and keep its next id in a
+        # matching namespace.  This still rejects a duplicate on the one bus
+        # where assigning two ids to that UUID would be ambiguous.
+        key = (canbus_iface, uuid)
+        if key in self.ids:
             raise config.error("Duplicate canbus_uuid")
-        new_id = len(self.ids) + NODEID_FIRST
-        self.ids[uuid] = new_id
+        new_id = self.next_nodeids.get(canbus_iface, NODEID_FIRST)
+        self.ids[key] = new_id
+        self.next_nodeids[canbus_iface] = new_id + 1
         return new_id
-    def get_nodeid(self, canbus_uuid):
-        uuid = int(canbus_uuid, 16)
-        if uuid not in self.ids:
+    def get_nodeid(self, canbus_uuid, canbus_iface):
+        key = (canbus_iface, int(canbus_uuid, 16))
+        if key not in self.ids:
             raise self.printer.config_error("Unknown canbus_uuid %s"
                                             % (canbus_uuid,))
-        return self.ids[uuid]
+        return self.ids[key]
 
 def load_config(config):
     return PrinterCANBus(config)

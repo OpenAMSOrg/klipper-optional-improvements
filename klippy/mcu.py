@@ -858,7 +858,8 @@ class MCUConnectHelper:
         try:
             if self._canbus_iface is not None:
                 cbid = self._printer.lookup_object('canbus_ids')
-                nodeid = cbid.get_nodeid(self._serialport)
+                nodeid = cbid.get_nodeid(self._serialport,
+                                         self._canbus_iface)
                 self._serial.connect_canbus(self._serialport, nodeid,
                                             self._canbus_iface)
             elif self._baud:
