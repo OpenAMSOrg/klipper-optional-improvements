@@ -6,7 +6,7 @@
 
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
-#include <string.h> // memchr, memset
+#include <string.h> // memchr
 #include "compiler.h" // likely
 #include "msgblock.h" // message_alloc
 #include "pyhelper.h" // errorf
@@ -164,7 +164,9 @@ struct queue_message *
 message_alloc(void)
 {
     struct queue_message *qm = malloc(sizeof(*qm));
-    memset(qm, 0, sizeof(*qm));
+    qm->len = 0;
+    qm->min_clock = qm->req_clock = 0;
+    qm->notify_id = 0;
     return qm;
 }
 
