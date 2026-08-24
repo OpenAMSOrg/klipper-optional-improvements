@@ -85,32 +85,42 @@ f4: *p++ = v & 0x7f;
     return p;
 }
 
-// Parse an integer that was encoded as a "variable length quantity"
-static uint32_t
-parse_int(uint8_t **pp)
+// Parse a bounded integer encoded as a "variable length quantity"
+static int
+parse_int(uint8_t **pp, uint8_t *end, uint32_t *value)
 {
-    uint8_t *p = *pp, c = *p++;
+    uint8_t *p = *pp;
+    if (p >= end)
+        return -1;
+    uint8_t c = *p++;
     uint32_t v = c & 0x7f;
     if ((c & 0x60) == 0x60)
         v |= -0x20;
+    int count = 1;
     while (c & 0x80) {
+        if (p >= end || count >= 5)
+            return -1;
         c = *p++;
         v = (v<<7) | (c & 0x7f);
+        count++;
     }
     *pp = p;
-    return v;
+    *value = v;
+    return 0;
 }
 
 // Parse the VLQ contents of a message
 int
 msgblock_decode(uint32_t *data, int data_len, uint8_t *msg, int msg_len)
 {
+    if (data_len < 0 || (!data && data_len) || !msg
+        || msg_len < MESSAGE_MIN || msg_len > MESSAGE_MAX)
+        return -1;
     uint8_t *p = &msg[MESSAGE_HEADER_SIZE];
     uint8_t *end = &msg[msg_len - MESSAGE_TRAILER_SIZE];
     while (data_len--) {
-        if (p >= end)
+        if (parse_int(&p, end, data++))
             return -1;
-        *data++ = parse_int(&p);
     }
     if (p != end)
         // Invalid message
@@ -136,6 +146,10 @@ message_alloc(void)
 struct queue_message *
 message_fill(uint8_t *data, int len)
 {
+    if (len < 0 || len > MESSAGE_MAX || (!data && len)) {
+        errorf("Invalid message length: %d", len);
+        return NULL;
+    }
     struct queue_message *qm = message_alloc();
     memcpy(qm->msg, data, len);
     qm->len = len;

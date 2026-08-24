@@ -939,7 +939,13 @@ serialqueue_send(struct serialqueue *sq, struct command_queue *cq, uint8_t *msg
                  , int len, uint64_t min_clock, uint64_t req_clock
                  , uint64_t notify_id)
 {
+    if (len < 0 || len > MESSAGE_PAYLOAD_MAX) {
+        errorf("Invalid serial message length: %d", len);
+        return;
+    }
     struct queue_message *qm = message_fill(msg, len);
+    if (!qm)
+        return;
     qm->min_clock = min_clock;
     qm->req_clock = req_clock;
     qm->notify_id = notify_id;
@@ -1030,6 +1036,8 @@ serialqueue_get_clock_est(struct serialqueue *sq, struct clock_estimate *ce)
 void __visible
 serialqueue_get_stats(struct serialqueue *sq, char *buf, int len)
 {
+    if (!buf || len <= 0)
+        return;
     struct serialqueue stats;
     pthread_mutex_lock(&sq->lock);
     pthread_mutex_lock(&sq->transmit_requests.lock);
