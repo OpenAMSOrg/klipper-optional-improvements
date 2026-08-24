@@ -211,6 +211,18 @@ drain_usb_host_messages(void)
          */
         if (ret != sizeof(*gs) || gs->can_dlc > sizeof(gs->data))
             continue;
+        /*
+         * device_config.icount advertises one CAN channel, so channel zero is
+         * the only value the gs_usb protocol permits for this interface.  The
+         * bridge echoes the host frame before routing it, including this field.
+         * Linux treats an echoed channel outside the advertised range as a
+         * broken device and detaches the CAN network interface.  Discard such
+         * a frame here so malformed USB output cannot be reflected back as an
+         * apparently fatal device response or be transmitted on the physical
+         * bus under a channel selector the firmware silently ignored.
+         */
+        if (gs->channel)
+            continue;
         UsbCan.host_push_pos = push_pos = push_pos + 1;
     }
 }
