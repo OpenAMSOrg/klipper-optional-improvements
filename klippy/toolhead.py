@@ -75,13 +75,19 @@ class Move:
     def calc_junction(self, prev_move):
         if not self.is_kinematic_move or not prev_move.is_kinematic_move:
             return
-        # Allow extra axes to calculate maximum junction
-        ea_v2 = [ea.calc_junction(prev_move, self, e_index+3)
-                 for e_index, ea in enumerate(self.toolhead.extra_axes)]
-        max_start_v2 = min([self.max_cruise_v2,
-                            prev_move.max_cruise_v2, prev_move.next_junction_v2,
-                            prev_move.max_start_v2 + prev_move.delta_v2]
-                           + ea_v2)
+        # Establish the kinematic limits as one scalar, then fold each extra
+        # axis into it as that axis calculates its own junction constraint.
+        # Building ea_v2 followed by a second concatenated list allocated two
+        # temporary containers for every move, even though min() consumes each
+        # value once and retains only the smallest.  The incremental minimum
+        # preserves the same axis order and result while keeping the common
+        # CoreXY-plus-extruder junction path free of those list allocations.
+        max_start_v2 = min(self.max_cruise_v2, prev_move.max_cruise_v2,
+                           prev_move.next_junction_v2,
+                           prev_move.max_start_v2 + prev_move.delta_v2)
+        for e_index, ea in enumerate(self.toolhead.extra_axes):
+            max_start_v2 = min(
+                max_start_v2, ea.calc_junction(prev_move, self, e_index+3))
         # Find max velocity using "approximated centripetal velocity"
         axes_r = self.axes_r
         prev_axes_r = prev_move.axes_r
