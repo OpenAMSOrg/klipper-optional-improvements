@@ -189,6 +189,18 @@ class LookAheadQueue:
                               , min(next_start_v2, cruise_v2))
             prev_cruise_v2 = cruise_v2
         # Remove processed moves from the queue
+        if flush_count == len(queue):
+            # A normal non-lazy flush transfers ownership of every queued move
+            # to _process_lookahead().  Slicing the complete list and then
+            # deleting the same references from the original performs two
+            # linear copies and reference-count updates merely to preserve the
+            # identity of an internal list which no caller can access.  Hand
+            # the populated list directly to the consumer and install a fresh
+            # empty queue for later submissions.  The lazy partial-flush case
+            # below must still retain its unprocessed suffix, so it deliberately
+            # keeps the established slice-and-delete behavior.
+            self.queue = []
+            return queue
         res = queue[:flush_count]
         del queue[:flush_count]
         return res
