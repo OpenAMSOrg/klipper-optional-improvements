@@ -64,9 +64,10 @@ struct serialqueue {
     // Multi-threaded support for pushing and pulling messages
     struct receiver receiver;
     struct transmit_requests transmit_requests;
-    // Threading
+    // Threading (track lifetime so a naturally exited thread is still joined)
     char name[16];
     pthread_t tid;
+    int thread_started, thread_joined;
     pthread_mutex_t lock; // protects variables below
     // Baud / clock tracking
     int receive_window;
@@ -788,6 +789,7 @@ serialqueue_alloc(int serial_fd, char serial_fd_type, int client_id
     ret = pthread_create(&sq->tid, NULL, background_thread, sq);
     if (ret)
         goto fail;
+    sq->thread_started = 1;
 
     return sq;
 
@@ -800,11 +802,15 @@ fail:
 void __visible
 serialqueue_exit(struct serialqueue *sq)
 {
+    if (!sq || !sq->thread_started || sq->thread_joined)
+        return;
     pollreactor_do_exit(sq->pr);
     kick_bg_thread(sq);
     int ret = pthread_join(sq->tid, NULL);
     if (ret)
         report_errno("pthread_join", ret);
+    else
+        sq->thread_joined = 1;
 }
 
 // Free all resources associated with a serialqueue
@@ -813,7 +819,7 @@ serialqueue_free(struct serialqueue *sq)
 {
     if (!sq)
         return;
-    if (!pollreactor_is_exit(sq->pr))
+    if (!sq->thread_joined)
         serialqueue_exit(sq);
     pthread_mutex_lock(&sq->lock);
     message_queue_free(&sq->sent_queue);
