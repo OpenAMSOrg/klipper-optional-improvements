@@ -4,7 +4,7 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
-#include <string.h> // memmove
+#include <string.h> // memcpy
 #include "autoconf.h" // CONFIG_USB_VENDOR_ID
 #include "board/canbus.h" // canbus_notify_tx
 #include "board/canserial.h" // canserial_notify_tx
@@ -142,8 +142,21 @@ send_frame(struct canbus_msg *msg)
     gs.echo_id = 0xffffffff;
     gs.can_id = msg->id;
     gs.can_dlc = msg->dlc;
-    gs.data32[0] = msg->data32[0];
-    gs.data32[1] = msg->data32[1];
+    /*
+     * A canbus_msg always reserves eight data bytes, but bytes beyond its DLC
+     * are not part of the CAN frame and are not guaranteed to have been
+     * initialized.  Hardware receive mailboxes may retain old register data,
+     * and short locally generated messages may leave the unused stack bytes
+     * untouched.  The gs_usb record always exposes all eight byte positions to
+     * the host, so copying the complete storage would cross that stale data
+     * over the USB trust boundary.  Copy only bytes that the CAN DLC makes
+     * visible;
+     * the zero-initialized destination supplies deterministic padding.  Remote
+     * transmission requests have a DLC but no data field, hence their copy
+     * length is deliberately zero.
+     */
+    uint32_t len = msg->id & CANMSG_ID_RTR ? 0 : CANMSG_DATA_LEN(msg);
+    memcpy(gs.data, msg->data, len);
     return usb_send_bulk_in(&gs, sizeof(gs));
 }
 
