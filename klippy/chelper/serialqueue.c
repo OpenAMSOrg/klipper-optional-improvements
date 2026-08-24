@@ -329,9 +329,19 @@ input_event(struct serialqueue *sq, double eventtime)
 {
     if (sq->serial_fd_type == SQT_CAN) {
         struct can_frame cf;
+        // Require one complete kernel CAN frame per read
         int ret = read(sq->serial_fd, &cf, sizeof(cf));
-        if (ret <= 0) {
-            report_errno("can read", ret);
+        if (ret != sizeof(cf)) {
+            if (ret >= 0)
+                errorf("Got incomplete CAN frame (size=%d)", ret);
+            else
+                report_errno("can read", ret);
+            pollreactor_do_exit(sq->pr);
+            return;
+        }
+        if (cf.can_dlc > CAN_MAX_DLEN
+            || cf.can_dlc > sizeof(sq->input_buf) - sq->input_pos) {
+            errorf("Got invalid CAN frame length: %d", cf.can_dlc);
             pollreactor_do_exit(sq->pr);
             return;
         }
@@ -396,6 +406,8 @@ do_write(struct serialqueue *sq, void *buf, int buflen)
     }
     // Write to CAN fd
     struct can_frame cf;
+    // Clear kernel-visible padding fields
+    memset(&cf, 0, sizeof(cf));
     while (buflen) {
         int size = buflen > 8 ? 8 : buflen;
         cf.can_id = sq->client_id;
