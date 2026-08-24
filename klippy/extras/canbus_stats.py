@@ -12,8 +12,12 @@ class PrinterCANBusStats:
         self.name = config.get_name().split()[-1]
         self.mcu = None
         self.get_canbus_status_cmd = None
+        self.get_canbus_diagnostics_cmd = None
         self.status = {'rx_error': None, 'tx_error': None, 'tx_retries': None,
-                       'bus_state': None}
+                       'bus_state': None, 'rx_overflows': None,
+                       'tx_discards': None, 'usb_invalid': None,
+                       'bus_off': None}
+        self.diagnostics_countdown = 0
         # Every canbus_stats object is registered during the same connection
         # phase.  If each first callback returns monotonic()+1, all later status
         # commands remain phase-locked and create a periodic request/response
@@ -49,6 +53,18 @@ class PrinterCANBusStats:
             "get_canbus_status",
             "canbus_status rx_error=%u tx_error=%u tx_retries=%u"
             " canbus_bus_state=%u")
+        # Do not add fields to the established canbus_status response.  Command
+        # and response formats are part of Klipper's host/MCU compatibility
+        # contract: changing that response would make an old host reject new
+        # firmware during message-dictionary validation.  A separately
+        # discoverable query permits every mixed-version combination instead.
+        # A new host simply omits diagnostics when connected to old firmware,
+        # while an old host never sends the additional command to new firmware.
+        if self.mcu.try_lookup_command("get_canbus_diagnostics") is not None:
+            self.get_canbus_diagnostics_cmd = self.mcu.lookup_query_command(
+                "get_canbus_diagnostics",
+                "canbus_diagnostics rx_overflows=%u tx_discards=%u"
+                " usb_invalid=%u bus_off=%u")
         # Register usb_canbus_state message handling (for usb to canbus bridge)
         if self.mcu.check_valid_response("usb_canbus_state discard=%u"):
             self.mcu.register_serial_response(self.handle_usb_canbus_state,
@@ -75,8 +91,32 @@ class PrinterCANBusStats:
         retries = prev_retries + ((params['tx_retries'] - prev_retries)
                                   & 0xffffffff)
         state = params['canbus_bus_state']
-        self.status = {'rx_error': rx, 'tx_error': tx, 'tx_retries': retries,
-                       'bus_state': state}
+        status = self.status.copy()
+        status.update({'rx_error': rx, 'tx_error': tx,
+                       'tx_retries': retries, 'bus_state': state})
+
+        # Queue loss and bus-off episodes are exceptional evidence, not values
+        # needed for one-second control or display decisions.  Querying them at
+        # the legacy status cadence would permanently double management traffic
+        # on every healthy CAN network to observe counters which normally stay
+        # at zero.  Reuse this already phase-staggered callback every five
+        # cycles instead.  The first query remains immediate so a pre-existing
+        # fault is visible promptly, and 32-bit extension below retains events
+        # across arbitrary counter wrap without requiring expensive 64-bit
+        # arithmetic in an MCU interrupt path.
+        if self.get_canbus_diagnostics_cmd is not None:
+            self.diagnostics_countdown -= 1
+            if self.diagnostics_countdown <= 0:
+                diag = self.get_canbus_diagnostics_cmd.send()
+                self.diagnostics_countdown = 5
+                for key in ('rx_overflows', 'tx_discards', 'usb_invalid',
+                            'bus_off'):
+                    previous = status[key]
+                    if previous is None:
+                        previous = 0
+                    status[key] = previous + ((diag[key] - previous)
+                                               & 0xffffffff)
+        self.status = status
         waketime = self.reactor.monotonic() + 1.
         if self.query_phase is not None:
             waketime += self.query_phase
@@ -86,10 +126,16 @@ class PrinterCANBusStats:
         status = self.status
         if status['rx_error'] is None:
             return (False, '')
-        return (False, 'canstat_%s: bus_state=%s rx_error=%d'
-                ' tx_error=%d tx_retries=%d'
-                % (self.name, status['bus_state'], status['rx_error'],
-                   status['tx_error'], status['tx_retries']))
+        msg = ('canstat_%s: bus_state=%s rx_error=%d'
+               ' tx_error=%d tx_retries=%d'
+               % (self.name, status['bus_state'], status['rx_error'],
+                  status['tx_error'], status['tx_retries']))
+        if status['rx_overflows'] is not None:
+            msg += (' rx_overflows=%d tx_discards=%d usb_invalid=%d'
+                    ' bus_off=%d'
+                    % (status['rx_overflows'], status['tx_discards'],
+                       status['usb_invalid'], status['bus_off']))
+        return (False, msg)
     def get_status(self, eventtime):
         return self.status
 

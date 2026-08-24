@@ -44,7 +44,11 @@ canbus_normalize_msg(struct canbus_msg *msg)
 
 struct canbus_status {
     uint32_t rx_error, tx_error, tx_retries;
-    uint32_t bus_state;
+    uint32_t bus_state, rx_overflows, bus_off;
+};
+
+struct canbus_diagnostics {
+    uint32_t rx_overflows, tx_discards, usb_invalid, bus_off;
 };
 
 enum {
@@ -62,5 +66,6 @@ int canbus_send(struct canbus_msg *msg);
 void canbus_set_filter(uint32_t id);
 void canbus_notify_tx(void);
 void canbus_process_data(struct canbus_msg *msg);
+void canbus_get_diagnostics(struct canbus_diagnostics *diag);
 
 #endif // canbus.h

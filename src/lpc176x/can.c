@@ -98,7 +98,8 @@
 #define CAN_ERROR_WARNING_LIMIT 96
 
 static struct {
-    uint32_t rx_error, tx_error;
+    uint32_t rx_error, tx_error, rx_overflows, bus_off;
+    uint8_t bus_off_active;
 } CAN_Errors;
 
 static uint32_t
@@ -210,13 +211,32 @@ canhw_get_status(struct canbus_status *status)
 {
     irqstatus_t flag = irq_save();
     uint32_t gsr = LPC_CANx->GSR;
+    /*
+     * The interrupt handler normally observes bus-off while releasing Reset
+     * Mode.  Sample the level here as well so a status query can not miss the
+     * transition if it races the shared interrupt.  Keep a latch because GSR
+     * reports a state, whereas diagnostics promise a count of distinct
+     * episodes; recovery clearing BS rearms the next transition.
+     */
+    if (gsr & CAN_GSR_BS) {
+        if (!CAN_Errors.bus_off_active) {
+            CAN_Errors.bus_off_active = 1;
+            CAN_Errors.bus_off++;
+        }
+    } else {
+        CAN_Errors.bus_off_active = 0;
+    }
     uint32_t rx_error = CAN_Errors.rx_error, tx_error = CAN_Errors.tx_error;
+    uint32_t rx_overflows = CAN_Errors.rx_overflows;
+    uint32_t bus_off = CAN_Errors.bus_off;
     irq_restore(flag);
 
     uint32_t rx_count = (gsr >> CAN_GSR_RXERR_Pos) & 0xff;
     uint32_t tx_count = (gsr >> CAN_GSR_TXERR_Pos) & 0xff;
     status->rx_error = rx_error;
     status->tx_error = tx_error;
+    status->rx_overflows = rx_overflows;
+    status->bus_off = bus_off;
     if (gsr & CAN_GSR_BS)
         status->bus_state = CANBUS_STATE_OFF;
     else if (rx_count >= CAN_ERROR_PASSIVE_LIMIT
@@ -259,6 +279,13 @@ CAN_IRQHandler(void)
 
     if (icr & CAN_ICR_DOI) {
         CAN_Errors.rx_error += 1;
+        /*
+         * DOI identifies a local receive-buffer overrun, not another malformed
+         * bit sequence on the bus.  Preserve the legacy rx_error increment for
+         * existing clients, and additionally expose the resource loss through
+         * the diagnostic counter so overload and wiring faults are separable.
+         */
+        CAN_Errors.rx_overflows++;
         LPC_CANx->CMR = CAN_CMR_CDO;
     }
 
@@ -294,8 +321,17 @@ CAN_IRQHandler(void)
      * sequences before becoming bus-on; this does not force the error counters
      * clear or permit an early return to active traffic.
      */
-    if ((LPC_CANx->GSR & CAN_GSR_BS) && (LPC_CANx->MOD & CAN_MOD_RM))
-        LPC_CANx->MOD &= ~CAN_MOD_RM;
+    uint32_t gsr = LPC_CANx->GSR;
+    if (gsr & CAN_GSR_BS) {
+        if (!CAN_Errors.bus_off_active) {
+            CAN_Errors.bus_off_active = 1;
+            CAN_Errors.bus_off++;
+        }
+        if (LPC_CANx->MOD & CAN_MOD_RM)
+            LPC_CANx->MOD &= ~CAN_MOD_RM;
+    } else {
+        CAN_Errors.bus_off_active = 0;
+    }
 }
 
 void

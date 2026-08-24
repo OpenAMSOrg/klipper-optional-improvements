@@ -61,6 +61,7 @@ static struct canbus_data {
     uint8_t receive_pos, invalid_bitrate;
     // Single-producer IRQ ring; publish indexes only after slot data is stable
     uint32_t admin_pull_pos, admin_push_pos;
+    uint32_t receive_overflows, admin_overflows;
 
     // Transfer buffers
     struct canbus_msg admin_queue[8];
@@ -344,8 +345,10 @@ canserial_process_data(struct canbus_msg *msg)
         // Add to incoming data buffer
         int rpos = CanData.receive_pos;
         uint32_t len = CANMSG_DATA_LEN(msg);
-        if (len > sizeof(CanData.receive_buf) - rpos)
+        if (len > sizeof(CanData.receive_buf) - rpos) {
+            CanData.receive_overflows++;
             return;
+        }
         memcpy(&CanData.receive_buf[rpos], msg->data, len);
         CanData.receive_pos = rpos + len;
         canserial_notify_rx();
@@ -388,9 +391,11 @@ canserial_process_data(struct canbus_msg *msg)
          * eight-entry queue.
          */
         uint32_t pullp = readl(&CanData.admin_pull_pos);
-        if (pushp - pullp >= ARRAY_SIZE(CanData.admin_queue))
-            // No space - drop message
+        if (pushp - pullp >= ARRAY_SIZE(CanData.admin_queue)) {
+            // No space - drop message and retain evidence for diagnostics
+            CanData.admin_overflows++;
             return;
+        }
         uint32_t pos = pushp % ARRAY_SIZE(CanData.admin_queue);
         memcpy(&CanData.admin_queue[pos], msg, sizeof(*msg));
         if (is_query)
@@ -520,6 +525,30 @@ command_get_canbus_status(uint32_t *args)
 }
 DECL_COMMAND_FLAGS(command_get_canbus_status, HF_IN_SHUTDOWN
                    , "get_canbus_status");
+
+void
+command_get_canbus_diagnostics(uint32_t *args)
+{
+    struct canbus_diagnostics diag;
+    memset(&diag, 0, sizeof(diag));
+    canbus_get_diagnostics(&diag);
+    /*
+     * Hardware, the CAN-to-USB bridge, and canserial each own different queue
+     * boundaries.  Aggregate their monotonically wrapping counters only when
+     * queried, keeping every receive fast path to one local increment while
+     * giving the host a single stable view of frames which could not advance.
+     * This is a separate optional command rather than extending canbus_status:
+     * older hosts continue matching that established response format exactly.
+     */
+    diag.rx_overflows += (readl(&CanData.receive_overflows)
+                          + readl(&CanData.admin_overflows));
+    sendf("canbus_diagnostics rx_overflows=%u tx_discards=%u"
+          " usb_invalid=%u bus_off=%u"
+          , diag.rx_overflows, diag.tx_discards
+          , diag.usb_invalid, diag.bus_off);
+}
+DECL_COMMAND_FLAGS(command_get_canbus_diagnostics, HF_IN_SHUTDOWN
+                   , "get_canbus_diagnostics");
 
 void
 command_get_canbus_id(uint32_t *args)

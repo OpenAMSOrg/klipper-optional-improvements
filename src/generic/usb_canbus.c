@@ -130,6 +130,7 @@ static struct usbcan_data {
     // State tracking for messages to be sent from host to canbus
     struct timer bus_send_timer;
     uint8_t bus_send_state, bus_send_timed_out;
+    uint32_t tx_discards, usb_invalid;
 
     // Canbus data from host
     uint8_t host_status;
@@ -139,6 +140,7 @@ static struct usbcan_data {
     // Data from physical canbus interface
     // Single-producer IRQ ring; indexes publish ownership across contexts
     uint32_t canhw_pull_pos, canhw_push_pos;
+    uint32_t canhw_overflows;
     struct canbus_msg canhw_queue[32];
 } UsbCan = {
     .bus_send_timer.func = usbcan_stall_event,
@@ -236,8 +238,10 @@ drain_usb_host_messages(void)
          * then be overwritten by the next complete transfer without making
          * partial state visible to the routing task.
          */
-        if (ret != sizeof(*gs) || gs->can_dlc > sizeof(gs->data))
+        if (ret != sizeof(*gs) || gs->can_dlc > sizeof(gs->data)) {
+            UsbCan.usb_invalid++;
             continue;
+        }
         /*
          * device_config.icount advertises one CAN channel, so channel zero is
          * the only value the gs_usb protocol permits for this interface.  The
@@ -248,8 +252,10 @@ drain_usb_host_messages(void)
          * apparently fatal device response or be transmitted on the physical
          * bus under a channel selector the firmware silently ignored.
          */
-        if (gs->channel)
+        if (gs->channel) {
+            UsbCan.usb_invalid++;
             continue;
+        }
         /*
          * bt_const.feature is zero and this endpoint implements only the
          * fixed-size classic CAN frame.  Consequently no gs_usb frame flag is
@@ -261,8 +267,10 @@ drain_usb_host_messages(void)
          * before echoing it so the format advertised during probe remains the
          * format used for every bulk transfer.
          */
-        if (gs->flags)
+        if (gs->flags) {
+            UsbCan.usb_invalid++;
             continue;
+        }
         /*
          * The routing code compares the complete can_id, but each hardware
          * backend masks that value down to either 11 or 29 identifier bits
@@ -274,8 +282,10 @@ drain_usb_host_messages(void)
          * removed.  Reject those ambiguous encodings so local routing, the
          * USB echo, and the physical bus all refer to the same CAN frame.
          */
-        if (!gs_can_id_is_valid(gs->can_id))
+        if (!gs_can_id_is_valid(gs->can_id)) {
+            UsbCan.usb_invalid++;
             continue;
+        }
         /*
          * GS_HOST_FRAME_ECHO_ID_RX distinguishes a device-originated receive
          * frame from the echo which completes a host transmit request.  If the
@@ -285,8 +295,10 @@ drain_usb_host_messages(void)
          * enough missing completions stop the SocketCAN transmit queue.  Only
          * the device-to-host path may create the receive marker.
          */
-        if (gs->echo_id == GS_HOST_FRAME_ECHO_ID_RX)
+        if (gs->echo_id == GS_HOST_FRAME_ECHO_ID_RX) {
+            UsbCan.usb_invalid++;
             continue;
+        }
         UsbCan.host_push_pos = push_pos = push_pos + 1;
     }
 }
@@ -345,9 +357,11 @@ try_canmsg_send(struct canbus_msg *msg)
         note_discard_state(1);
         UsbCan.bus_send_state = BSS_DISCARDING;
     }
-    if (UsbCan.bus_send_state == BSS_DISCARDING)
+    if (UsbCan.bus_send_state == BSS_DISCARDING) {
         // Queue is stalled - just discard the message
+        UsbCan.tx_discards++;
         return 0;
+    }
     if (UsbCan.bus_send_state == BSS_READY) {
         /*
          * A stored deadline alone can not guarantee progress: the routing task
@@ -471,9 +485,11 @@ canbus_process_data(struct canbus_msg *msg)
     // Add to admin command queue
     uint32_t pushp = UsbCan.canhw_push_pos;
     uint32_t pullp = readl(&UsbCan.canhw_pull_pos);
-    if (pushp - pullp >= ARRAY_SIZE(UsbCan.canhw_queue))
+    if (pushp - pullp >= ARRAY_SIZE(UsbCan.canhw_queue)) {
         // No space - drop message
+        UsbCan.canhw_overflows++;
         return;
+    }
     if (UsbCan.assigned_id && (msg->id & ~1) == UsbCan.assigned_id)
         // Id reserved for local
         return;
@@ -517,6 +533,24 @@ void
 canbus_set_filter(uint32_t id)
 {
     UsbCan.assigned_id = id;
+}
+
+void
+canbus_get_diagnostics(struct canbus_diagnostics *diag)
+{
+    struct canbus_status status;
+    memset(&status, 0, sizeof(status));
+    canhw_get_status(&status);
+    /*
+     * canhw_overflows is interrupt-owned; acquire it explicitly before adding
+     * the task-owned bridge counters.  All counters intentionally wrap at 32
+     * bits like existing CAN error statistics, allowing the host to extend them
+     * without adding synchronization or wide arithmetic to MCU hot paths.
+     */
+    diag->rx_overflows = status.rx_overflows + readl(&UsbCan.canhw_overflows);
+    diag->tx_discards = UsbCan.tx_discards;
+    diag->usb_invalid = UsbCan.usb_invalid;
+    diag->bus_off = status.bus_off;
 }
 
 

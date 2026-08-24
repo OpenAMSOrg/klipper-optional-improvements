@@ -202,7 +202,7 @@ canhw_set_filter(uint32_t id)
 }
 
 static struct {
-    uint32_t rx_error, tx_error;
+    uint32_t rx_error, tx_error, rx_overflows, bus_off;
 } CAN_Errors;
 
 // Report interface status
@@ -219,10 +219,14 @@ canhw_get_status(struct canbus_status *status)
             CAN_Errors.rx_error += 1;
     }
     uint32_t rx_error = CAN_Errors.rx_error, tx_error = CAN_Errors.tx_error;
+    uint32_t rx_overflows = CAN_Errors.rx_overflows;
+    uint32_t bus_off = CAN_Errors.bus_off;
     irq_restore(flag);
 
     status->rx_error = rx_error;
     status->tx_error = tx_error;
+    status->rx_overflows = rx_overflows;
+    status->bus_off = bus_off;
     if (psr & CAN_PSR_BO)
         status->bus_state = CANBUS_STATE_OFF;
     else if (psr & CAN_PSR_EP)
@@ -276,6 +280,21 @@ CAN_IRQHandler(void)
             canbus_process_data(&msg);
         }
     }
+    if (ir & CAN_IR_RF0L) {
+        /*
+         * RF0L is the only conclusive evidence that the controller discarded
+         * a complete, otherwise valid frame because software did not return a
+         * FIFO slot in time.  LEC and the receive error counter describe CAN
+         * protocol faults on the wire; they do not change for this local
+         * resource loss.  Preserve a separate monotonically wrapping count so
+         * a host can distinguish signal-integrity trouble from IRQ latency or
+         * an undersized receive path.  One interrupt flag represents at least
+         * one lost frame, so the count is deliberately a lower bound when a
+         * sustained burst overwrites more than one element before service.
+         */
+        CANx->IR.reg = CAN_IR_RF0L;
+        CAN_Errors.rx_overflows++;
+    }
     if (ir & FDCAN_IE_TC) {
         /*
          * IR records completions even while their interrupt sources are
@@ -303,6 +322,7 @@ CAN_IRQHandler(void)
          * shorten the protocol's recovery safety interval.
          */
         CANx->IR.reg = CAN_IR_BO;
+        CAN_Errors.bus_off++;
         CANx->CCCR.reg &= ~CAN_CCCR_INIT;
     }
     if (ir & (CAN_IR_PED | CAN_IR_PEA)) {
@@ -457,7 +477,7 @@ can_init(void)
     /*##-3- Configure Interrupts #################################*/
     armcm_enable_irq(CAN_IRQHandler, CANx_IRQn, 1);
     CANx->ILE.reg = CAN_ILE_EINT0;
-    CANx->IE.reg = (CAN_IE_RF0NE | CAN_IE_BOE
+    CANx->IE.reg = (CAN_IE_RF0NE | CAN_IE_RF0LE | CAN_IE_BOE
                     | CAN_IE_PEDE | CAN_IE_PEAE);
 }
 DECL_INIT(can_init);

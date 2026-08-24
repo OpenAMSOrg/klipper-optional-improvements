@@ -169,7 +169,8 @@ canhw_set_filter(uint32_t id)
 }
 
 static struct {
-    uint32_t rx_error, tx_error;
+    uint32_t rx_error, tx_error, rx_overflows, bus_off;
+    uint8_t bus_off_active;
 } CAN_Errors;
 
 // Report interface status
@@ -178,11 +179,30 @@ canhw_get_status(struct canbus_status *status)
 {
     irqstatus_t flag = irq_save();
     uint32_t esr = SOC_CAN->ESR;
+    /*
+     * Normally the error interrupt records this transition.  Also sample it
+     * here so diagnostics remain truthful if status is queried after bus-off
+     * but before the shared or temporarily masked error vector is serviced.
+     * The active latch prevents repeated status queries from counting the same
+     * episode; ABOM clearing BOFF rearms the next transition.
+     */
+    if (esr & CAN_ESR_BOFF) {
+        if (!CAN_Errors.bus_off_active) {
+            CAN_Errors.bus_off_active = 1;
+            CAN_Errors.bus_off++;
+        }
+    } else {
+        CAN_Errors.bus_off_active = 0;
+    }
     uint32_t rx_error = CAN_Errors.rx_error, tx_error = CAN_Errors.tx_error;
+    uint32_t rx_overflows = CAN_Errors.rx_overflows;
+    uint32_t bus_off = CAN_Errors.bus_off;
     irq_restore(flag);
 
     status->rx_error = rx_error;
     status->tx_error = tx_error;
+    status->rx_overflows = rx_overflows;
+    status->bus_off = bus_off;
     if (esr & CAN_ESR_BOFF)
         status->bus_state = CANBUS_STATE_OFF;
     else if (esr & CAN_ESR_EPVF)
@@ -197,7 +217,20 @@ canhw_get_status(struct canbus_status *status)
 void
 CAN_IRQHandler(void)
 {
-    if (SOC_CAN->RF0R & CAN_RF0R_FMP0) {
+    uint32_t rf0r = SOC_CAN->RF0R;
+    if (rf0r & CAN_RF0R_FOVR0) {
+        /*
+         * FIFO overrun means a valid frame reached bxCAN but could not be
+         * retained until software read it.  This is not a protocol receive
+         * error and therefore is absent from ESR's error counters.  Clear the
+         * sticky indication and retain a separate wrapping count.  One flag
+         * may cover several losses during a sustained overload, so the result
+         * is an actionable lower bound rather than a fabricated exact total.
+         */
+        SOC_CAN->RF0R = CAN_RF0R_FOVR0;
+        CAN_Errors.rx_overflows++;
+    }
+    if (rf0r & CAN_RF0R_FMP0) {
         // Read and ack data packet
         CAN_FIFOMailBox_TypeDef *mb = &SOC_CAN->sFIFOMailBox[0];
         uint32_t rir = mb->RIR;
@@ -229,6 +262,14 @@ CAN_IRQHandler(void)
     uint32_t msr = SOC_CAN->MSR;
     if (msr & CAN_MSR_ERRI) {
         uint32_t esr = SOC_CAN->ESR;
+        if (esr & CAN_ESR_BOFF) {
+            if (!CAN_Errors.bus_off_active) {
+                CAN_Errors.bus_off_active = 1;
+                CAN_Errors.bus_off++;
+            }
+        } else {
+            CAN_Errors.bus_off_active = 0;
+        }
         uint32_t lec = (esr & CAN_ESR_LEC_Msk) >> CAN_ESR_LEC_Pos;
         if (lec && lec != 7) {
             SOC_CAN->ESR = 7 << CAN_ESR_LEC_Pos;
@@ -347,6 +388,7 @@ can_init(void)
         armcm_enable_irq(CAN_IRQHandler, CAN_TX_IRQn, 0);
     if (CAN_RX0_IRQn != CAN_SCE_IRQn)
         armcm_enable_irq(CAN_IRQHandler, CAN_SCE_IRQn, 0);
-    SOC_CAN->IER = CAN_IER_FMPIE0 | CAN_IER_ERRIE | CAN_IER_LECIE;
+    SOC_CAN->IER = (CAN_IER_FMPIE0 | CAN_IER_FOVIE0
+                    | CAN_IER_ERRIE | CAN_IER_LECIE);
 }
 DECL_INIT(can_init);
