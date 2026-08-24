@@ -36,7 +36,9 @@ else:
     json_dumps = msgspec.json.encode
     json_loads = msgspec.json.decode
 
+# Bounds on resources controlled by API clients
 REQUEST_LOG_SIZE = 20
+MAX_CLIENT_CONNECTIONS = 64
 
 class WebRequestError(gcode.CommandError):
     def __init__(self, message,):
@@ -146,6 +148,10 @@ class ServerSocket:
         try:
             sock, addr = self.sock.accept()
         except socket.error:
+            return
+        if len(self.clients) >= MAX_CLIENT_CONNECTIONS:
+            logging.warning("webhooks: Rejecting excess client connection")
+            sock.close()
             return
         sock.setblocking(0)
         client = ClientConnection(self, sock)
