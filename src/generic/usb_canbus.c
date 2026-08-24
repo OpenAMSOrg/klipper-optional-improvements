@@ -195,9 +195,22 @@ drain_usb_host_messages(void)
         uint32_t pushp = push_pos % ARRAY_SIZE(UsbCan.host_frames);
         struct gs_host_frame *gs = &UsbCan.host_frames[pushp];
         int ret = usb_read_bulk_out(gs, sizeof(*gs));
-        if (ret <= 0)
+        if (ret < 0)
             // No more messages ready
             break;
+        /*
+         * A successful endpoint read may still be shorter than the fixed
+         * gs_host_frame record.  This queue slot is reused, so publishing a
+         * short transfer would combine its new prefix with an old CAN id, DLC,
+         * or payload suffix and transmit data the host did not provide in this
+         * request.  Also reject a DLC larger than the eight bytes implemented
+         * by the classic-CAN record and by struct canbus_msg.  Consume
+         * malformed USB records but do not advance host_push_pos; the slot can
+         * then be overwritten by the next complete transfer without making
+         * partial state visible to the routing task.
+         */
+        if (ret != sizeof(*gs) || gs->can_dlc > sizeof(gs->data))
+            continue;
         UsbCan.host_push_pos = push_pos = push_pos + 1;
     }
 }
