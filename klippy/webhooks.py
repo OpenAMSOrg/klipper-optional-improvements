@@ -40,6 +40,7 @@ else:
 REQUEST_LOG_SIZE = 20
 MAX_REQUEST_SIZE = 1024 * 1024
 MAX_REQUEST_LOG_ENTRY = 16 * 1024
+MAX_SEND_BUFFER_SIZE = 8 * 1024 * 1024
 MAX_CLIENT_CONNECTIONS = 64
 MAX_REQUESTS_PER_READ = 128
 
@@ -318,6 +319,13 @@ class ClientConnection:
     def send(self, data):
         try:
             jmsg = json_dumps(data)
+            if (len(jmsg) > MAX_SEND_BUFFER_SIZE
+                or len(self.send_buffer) + len(jmsg) + 1
+                   > MAX_SEND_BUFFER_SIZE):
+                logging.warning("webhooks: Closing client %s with excessive "
+                                "response data", self.uid)
+                self.close()
+                return
             self.send_buffer += jmsg + b"\x03"
         except (TypeError, ValueError) as e:
             msg = ("json encoding error: %s" % (str(e),))
