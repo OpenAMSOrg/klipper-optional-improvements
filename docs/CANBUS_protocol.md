@@ -38,7 +38,8 @@ delay that response by an interval derived from their `canbus_uuid` so
 that multiple unassigned nodes do not normally transmit the response
 with the same CAN bus id at the same time. Response slots are separated
 by enough time to transmit the complete response at the configured CAN
-bus frequency.
+bus frequency, and the slot selection changes on later queries so that
+a collision in one discovery round does not persist indefinitely.
 
 The CMD_QUERY_UNASSIGNED message format is:
 `<1-byte message_id = 0x00>`
