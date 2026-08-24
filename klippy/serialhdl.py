@@ -163,13 +163,32 @@ class SerialReader:
         while 1:
             if self.reactor.monotonic() > start_time + 90.:
                 self._error("Unable to connect")
+            bus = None
             try:
                 bus = can.interface.Bus(channel=canbus_iface,
                                         can_filters=filters,
                                         bustype='socketcan')
                 bus.send(set_id_msg)
             except (can.CanError, os.error, IOError) as e:
-                logging.warning("%sUnable to open CAN port: %s",
+                if bus is not None:
+                    # Socket construction and the first assignment send share
+                    # one retry block, but they do not share resource
+                    # ownership.  Once construction succeeds, bus owns a raw
+                    # SocketCAN socket and the receive filters installed for
+                    # it, even if the first frame can not be queued.  Leaving
+                    # that partially initialized object open is especially
+                    # costly here: the retry loop may run for 90 seconds and
+                    # would create another socket and filter set on every
+                    # attempt.  Test the acquisition state explicitly and
+                    # release it before pausing.  Cleanup is best-effort and
+                    # logged separately so a shutdown error can not replace
+                    # the CAN access error which caused this retry.
+                    try:
+                        bus.shutdown()
+                    except Exception:
+                        logging.exception("%sUnable to close CAN port",
+                                          self.warn_prefix)
+                logging.warning("%sUnable to access CAN port: %s",
                                 self.warn_prefix, e)
                 self.reactor.pause(self.reactor.monotonic() + 5.)
                 continue
