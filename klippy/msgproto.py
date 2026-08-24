@@ -5,6 +5,11 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import json, zlib, logging, math
 
+try:
+    integer_types = (int, long)
+except NameError:
+    integer_types = (int,)
+
 DefaultMessages = {
     "identify_response offset=%u data=%.*s": 0,
     "identify offset=%u count=%c": 1,
@@ -22,6 +27,11 @@ MESSAGE_PAYLOAD_MAX = MESSAGE_MAX - MESSAGE_MIN
 MESSAGE_SEQ_MASK = 0x0f
 MESSAGE_DEST = 0x10
 MESSAGE_SYNC = 0x7e
+# Bound memory and parsing work from MCU supplied data dictionaries
+MAX_IDENTIFY_SIZE = 2 * 1024 * 1024
+MAX_ENUMERATION_VALUES = 65536
+MAX_MESSAGE_FORMATS = 65536
+MAX_CONFIG_CONSTANTS = 65536
 
 class error(Exception):
     pass
@@ -46,15 +56,21 @@ class PT_uint32:
         if v >= 0x60 or v < -0x20:           out.append((v>>7)  & 0x7f | 0x80)
         out.append(v & 0x7f)
     def parse(self, s, pos):
+        if pos >= len(s):
+            raise error("Truncated VLQ value")
         c = s[pos]
         pos += 1
         v = c & 0x7f
         if (c & 0x60) == 0x60:
             v |= -0x20
+        count = 1
         while c & 0x80:
+            if pos >= len(s) or count >= self.max_length:
+                raise error("Invalid VLQ value")
             c = s[pos]
             pos += 1
             v = (v<<7) | (c & 0x7f)
+            count += 1
         if not self.signed:
             v = int(v & 0xffffffff)
         return v, pos
@@ -74,10 +90,16 @@ class PT_string:
     is_dynamic_string = True
     max_length = 64
     def encode(self, out, v):
+        if len(v) > 0xff:
+            raise error("String parameter is too long")
         out.append(len(v))
         out.extend(bytearray(v))
     def parse(self, s, pos):
+        if pos >= len(s):
+            raise error("Truncated string length")
         l = s[pos]
+        if pos + l + 1 > len(s):
+            raise error("Truncated string value")
         return bytes(bytearray(s[pos+1:pos+l+1])), pos+l+1
 class PT_progmem_buffer(PT_string):
     pass
@@ -172,11 +194,15 @@ class MessageFormat:
         out = list(self.msgid_bytes)
         for i, t in enumerate(self.param_types):
             t.encode(out, params[i])
+        if len(out) > MESSAGE_PAYLOAD_MAX:
+            raise error("Encoded message exceeds maximum length")
         return out
     def encode_by_name(self, **params):
         out = list(self.msgid_bytes)
         for name, t in self.param_names:
             t.encode(out, params[name])
+        if len(out) > MESSAGE_PAYLOAD_MAX:
+            raise error("Encoded message exceeds maximum length")
         return out
     def parse(self, s, pos):
         pos += len(self.msgid_bytes)
@@ -290,6 +316,8 @@ class MessageParser:
         params['#name'] = mid.name
         return params
     def encode_msgblock(self, seq, cmd):
+        if len(cmd) > MESSAGE_PAYLOAD_MAX:
+            self._error("Encoded message exceeds maximum length")
         msglen = MESSAGE_MIN + len(cmd)
         seq = (seq & MESSAGE_SEQ_MASK) | MESSAGE_DEST
         out = [msglen, seq] + cmd
@@ -375,14 +403,31 @@ class MessageParser:
         res['#name'] = msgname
         return res
     def fill_enumerations(self, enumerations):
+        if type(enumerations) != dict:
+            self._error("Invalid enumerations")
+        value_count = sum(len(enums) for enums in self.enumerations.values())
         for add_name, add_enums in enumerations.items():
+            if type(add_enums) != dict:
+                self._error("Invalid enumeration '%s'", add_name)
             enums = self.enumerations.setdefault(add_name, {})
             for enum, value in add_enums.items():
-                if type(value) == type(0):
+                if isinstance(value, integer_types) and not isinstance(value,
+                                                                        bool):
                     # Simple enumeration
                     enums[str(enum)] = value
+                    value_count += 1
+                    if value_count > MAX_ENUMERATION_VALUES:
+                        self._error("Too many enumeration values")
                     continue
                 # Enumeration range
+                if (type(value) not in (list, tuple) or len(value) != 2
+                    or not isinstance(value[0], integer_types)
+                    or isinstance(value[0], bool)
+                    or not isinstance(value[1], integer_types)
+                    or isinstance(value[1], bool)
+                    or value[1] < 0
+                    or value_count + value[1] > MAX_ENUMERATION_VALUES):
+                    self._error("Invalid enumeration range '%s'", enum)
                 enum = enum_root = str(enum)
                 while enum_root and enum_root[-1].isdigit():
                     enum_root = enum_root[:-1]
@@ -392,6 +437,7 @@ class MessageParser:
                 start_value, count = value
                 for i in range(count):
                     enums[enum_root + str(start_enum + i)] = start_value + i
+                value_count += count
     def _init_messages(self, messages, command_ids=[], output_ids=[]):
         for msgformat, msgid in messages.items():
             msgtype = 'response'
@@ -413,19 +459,48 @@ class MessageParser:
     def process_identify(self, data, decompress=True):
         try:
             if decompress:
-                data = zlib.decompress(data)
+                compressed_data = data
+                decompressor = zlib.decompressobj()
+                data = decompressor.decompress(data, MAX_IDENTIFY_SIZE + 1)
+                stream_complete = getattr(decompressor, 'eof', None)
+                if stream_complete is None:
+                    # Python 2 lacks Decompress.eof - validate the zlib
+                    # trailer checksum as a bounded compatibility fallback.
+                    if len(compressed_data) >= 6:
+                        trailer = bytearray(compressed_data[-4:])
+                        expected_adler = sum(
+                            trailer[i] << (24 - i * 8) for i in range(4))
+                        stream_complete = (
+                            zlib.adler32(data) & 0xffffffff) == expected_adler
+                    else:
+                        stream_complete = False
+                if (len(data) > MAX_IDENTIFY_SIZE
+                    or decompressor.unconsumed_tail or decompressor.unused_data
+                    or not stream_complete):
+                    self._error("MCU identify data exceeds maximum size")
+            elif len(data) > MAX_IDENTIFY_SIZE:
+                self._error("MCU identify data exceeds maximum size")
             self.raw_identify_data = data
             data = json.loads(data)
+            if type(data) != dict:
+                self._error("Invalid MCU identify data")
             self.fill_enumerations(data.get('enumerations', {}))
             commands = data.get('commands')
             responses = data.get('responses')
             output = data.get('output', {})
+            config = data.get('config', {})
+            if (type(commands) != dict or type(responses) != dict
+                or type(output) != dict or type(config) != dict
+                or sum(len(v) for v in (commands, responses, output))
+                   > MAX_MESSAGE_FORMATS
+                or len(config) > MAX_CONFIG_CONSTANTS):
+                self._error("Invalid MCU identify data")
             all_messages = dict(commands)
             all_messages.update(responses)
             all_messages.update(output)
             self._init_messages(all_messages, commands.values(),
                                 output.values())
-            self.config.update(data.get('config', {}))
+            self.config.update(config)
             self.version = data.get('version', '')
             self.build_versions = data.get('build_versions', '')
         except error as e:

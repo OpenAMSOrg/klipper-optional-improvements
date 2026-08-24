@@ -53,7 +53,12 @@ class SerialReader:
                 completion = self.pending_notifications.pop(response.notify_id)
                 self.reactor.async_complete(completion, params)
                 continue
-            params = self.msgparser.parse(response.msg[0:count])
+            try:
+                params = self.msgparser.parse(response.msg[0:count])
+            except Exception:
+                logging.exception("%sInvalid message from MCU",
+                                  self.warn_prefix)
+                continue
             params['#sent_time'] = response.sent_time
             params['#receive_time'] = response.receive_time
             hdl = (params['#name'], params.get('oid'))
@@ -68,21 +73,31 @@ class SerialReader:
         raise error(self.warn_prefix + (msg % params))
     def _get_identify_data(self, eventtime):
         # Query the "data dictionary" from the micro-controller
-        identify_data = b""
+        # Keep chunks separate to avoid quadratic copying of MCU supplied data
+        identify_chunks = []
+        identify_size = 0
         while 1:
-            msg = "identify offset=%d count=%d" % (len(identify_data), 40)
+            msg = "identify offset=%d count=%d" % (identify_size, 40)
             try:
                 params = self.send_with_response(msg, 'identify_response')
             except error as e:
                 logging.exception("%sWait for identify_response",
                                   self.warn_prefix)
                 return None
-            if params['offset'] == len(identify_data):
-                msgdata = params['data']
-                if not msgdata:
-                    # Done
-                    return identify_data
-                identify_data += msgdata
+            if params['offset'] != identify_size:
+                logging.error("%sMCU identify response has invalid offset",
+                              self.warn_prefix)
+                return None
+            msgdata = params['data']
+            if not msgdata:
+                # Done
+                return b''.join(identify_chunks)
+            if identify_size + len(msgdata) > msgproto.MAX_IDENTIFY_SIZE:
+                logging.error("%sMCU identify data exceeds maximum size",
+                              self.warn_prefix)
+                return None
+            identify_chunks.append(msgdata)
+            identify_size += len(msgdata)
     def _start_session(self, serial_dev, serial_fd_type=b'u', client_id=0):
         self.serial_dev = serial_dev
         self.serialqueue = self.ffi_main.gc(
@@ -249,9 +264,13 @@ class SerialReader:
                 self.handlers[name, oid] = callback
     # Command sending
     def raw_send(self, cmd, minclock, reqclock, cmd_queue):
+        if len(cmd) > msgproto.MESSAGE_PAYLOAD_MAX:
+            self._error("Serial message exceeds maximum length")
         self.ffi_lib.serialqueue_send(self.serialqueue, cmd_queue,
                                       cmd, len(cmd), minclock, reqclock, 0)
     def raw_send_wait_ack(self, cmd, minclock, reqclock, cmd_queue):
+        if len(cmd) > msgproto.MESSAGE_PAYLOAD_MAX:
+            self._error("Serial message exceeds maximum length")
         self.last_notify_id += 1
         nid = self.last_notify_id
         completion = self.reactor.completion()
