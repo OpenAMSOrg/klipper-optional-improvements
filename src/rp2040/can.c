@@ -115,7 +115,26 @@ can_init(void)
 
     // Start canbus
     uint32_t pclk = get_pclock_frequency(RESETS_RESET_PIO0_RESET);
+    /*
+     * can2040 represents its PIO clock divider in 16.8 fixed point.  Its setup
+     * calculation previously truncated any fractional remainder, so the host
+     * could be told CANBUS_FREQUENCY while the PIO sampled a nearby physical
+     * rate.  Validate the exact encoded divider, including the hardware's
+     * minimum divide-by-one and 16-bit integer limit, before starting the state
+     * machines.  This rejects only rates this clock can not represent exactly.
+     */
+    uint64_t divider_numerator = (256 / 32) * (uint64_t)pclk;
+    if (!CONFIG_CANBUS_FREQUENCY
+        || divider_numerator % CONFIG_CANBUS_FREQUENCY)
+        goto invalid_bitrate;
+    uint64_t divider = divider_numerator / CONFIG_CANBUS_FREQUENCY;
+    if (divider < 256 || divider > 0xffffff)
+        goto invalid_bitrate;
     can2040_start(&cbus, pclk, CONFIG_CANBUS_FREQUENCY
                   , CONFIG_RPXXXX_CANBUS_GPIO_RX, CONFIG_RPXXXX_CANBUS_GPIO_TX);
+    return;
+
+invalid_bitrate:
+    canserial_set_invalid_bitrate();
 }
 DECL_INIT(can_init);

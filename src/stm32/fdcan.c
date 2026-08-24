@@ -387,6 +387,17 @@ compute_btr(uint32_t pclock, uint32_t bitrate)
         Use the lowest brp where ts1 and ts2 are in valid range
      */
 
+    /*
+     * Integer division here used to discard any pclock remainder.  The NBTP
+     * value then described the nearest lower number of peripheral clocks while
+     * CANBUS_FREQUENCY still advertised the requested rate to the host.  CAN
+     * nodes need the same nominal bit period to arbitrate reliably, so silently
+     * selecting a nearby rate is worse than refusing an invalid build-time
+     * choice.  Require an exact peripheral-clock division and a legal 1..512
+     * prescaler before programming the controller.
+     */
+    if (!bitrate || pclock % bitrate)
+        return CAN_INVALID_BTR;
     uint32_t bit_clocks = pclock / bitrate; // clock ticks per bit
 
     uint32_t sjw = 2;
@@ -394,15 +405,16 @@ compute_btr(uint32_t pclock, uint32_t bitrate)
     // Find number of time quantas that gives us the exact wanted bit time
     for (qs = 18; qs > 9; qs--) {
         // check that bit_clocks / quantas is an integer
-        uint32_t brp_rem = bit_clocks % qs;
-        if (brp_rem == 0)
-            break;
+        if (bit_clocks % qs)
+            continue;
+        uint32_t brp = bit_clocks / qs;
+        if (!brp || brp > 512)
+            continue;
+        uint32_t time_seg2 = qs / 8; // sample at ~87.5%
+        uint32_t time_seg1 = qs - (1 + time_seg2);
+        return make_btr(sjw, time_seg1, time_seg2, brp);
     }
-    uint32_t brp       = bit_clocks / qs;
-    uint32_t time_seg2 = qs / 8; // sample at ~87.5%
-    uint32_t time_seg1 = qs - (1 + time_seg2);
-
-    return make_btr(sjw, time_seg1, time_seg2, brp);
+    return CAN_INVALID_BTR;
 }
 
 void
@@ -416,6 +428,10 @@ can_init(void)
     uint32_t pclock = get_pclock_frequency((uint32_t)SOC_CAN);
 
     uint32_t btr = compute_btr(pclock, CONFIG_CANBUS_FREQUENCY);
+    if (btr == CAN_INVALID_BTR) {
+        canserial_set_invalid_bitrate();
+        return;
+    }
 
     /*##-1- Configure the CAN #######################################*/
 

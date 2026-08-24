@@ -271,6 +271,15 @@ compute_btr(uint32_t pclock, uint32_t bitrate)
         Use the lowest brp where ts1 and ts2 are in valid range
      */
 
+    /*
+     * Do not round a requested bus rate through integer division.  The value
+     * exported as CANBUS_FREQUENCY must describe the bit period programmed into
+     * bxCAN exactly; otherwise this node can sample at a different rate from
+     * clients which trusted that constant.  Require both exact clock division
+     * and the controller's legal 1..1024 prescaler range.
+     */
+    if (!bitrate || pclock % bitrate)
+        return CAN_INVALID_BTR;
     uint32_t bit_clocks = pclock / bitrate; // clock ticks per bit
 
     uint32_t sjw = 2;
@@ -278,15 +287,16 @@ compute_btr(uint32_t pclock, uint32_t bitrate)
     // Find number of time quantas that gives us the exact wanted bit time
     for (qs = 18; qs > 9; qs--) {
         // check that bit_clocks / quantas is an integer
-        uint32_t brp_rem = bit_clocks % qs;
-        if (brp_rem == 0)
-            break;
+        if (bit_clocks % qs)
+            continue;
+        uint32_t brp = bit_clocks / qs;
+        if (!brp || brp > 1024)
+            continue;
+        uint32_t time_seg2 = qs / 8; // sample at ~87.5%
+        uint32_t time_seg1 = qs - (1 + time_seg2);
+        return make_btr(sjw, time_seg1, time_seg2, brp);
     }
-    uint32_t brp       = bit_clocks / qs;
-    uint32_t time_seg2 = qs / 8; // sample at ~87.5%
-    uint32_t time_seg1 = qs - (1 + time_seg2);
-
-    return make_btr(sjw, time_seg1, time_seg2, brp);
+    return CAN_INVALID_BTR;
 }
 
 void
@@ -304,6 +314,10 @@ can_init(void)
     uint32_t pclock = get_pclock_frequency((uint32_t)SOC_CAN);
 
     uint32_t btr = compute_btr(pclock, CONFIG_CANBUS_FREQUENCY);
+    if (btr == CAN_INVALID_BTR) {
+        canserial_set_invalid_bitrate();
+        return;
+    }
 
     /*##-1- Configure the CAN #######################################*/
 

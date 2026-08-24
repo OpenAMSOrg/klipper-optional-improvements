@@ -58,7 +58,7 @@ static struct canbus_data {
 
     // Rx data
     struct task_wake rx_wake;
-    uint8_t receive_pos;
+    uint8_t receive_pos, invalid_bitrate;
     // Single-producer IRQ ring; publish indexes only after slot data is stable
     uint32_t admin_pull_pos, admin_push_pos;
 
@@ -316,6 +316,23 @@ canserial_notify_rx(void)
     sched_wake_task(&CanData.rx_wake);
 }
 
+void
+canserial_set_invalid_bitrate(void)
+{
+    /*
+     * Board initialization runs before sched_main() establishes the recovery
+     * point used by shutdown().  A CAN driver therefore can not safely call
+     * shutdown directly when its runtime peripheral clock can not represent
+     * the configured bitrate.  Publish the failure and wake this existing task;
+     * its first scheduler invocation occurs after shutdown handling is live.
+     * The driver returns before it programs or starts the CAN controller, so an
+     * invalid configuration can never place approximately timed frames on the
+     * bus even if its peripheral clock and pin mux were already prepared.
+     */
+    writeb(&CanData.invalid_bitrate, 1);
+    canserial_notify_rx();
+}
+
 DECL_CONSTANT("RECEIVE_WINDOW", ARRAY_SIZE(CanData.receive_buf));
 
 // Handle incoming data (called from IRQ handler)
@@ -421,6 +438,8 @@ canserial_rx_task(void)
 {
     if (!sched_check_wake(&CanData.rx_wake))
         return;
+    if (readb(&CanData.invalid_bitrate))
+        shutdown("Invalid CAN bitrate");
 
     // Process pending admin messages
     for (;;) {

@@ -10,6 +10,7 @@
 #include "command.h" // DECL_CONSTANT_STR
 #include "compiler.h" // DIV_ROUND_CLOSEST
 #include "generic/canbus.h" // canbus_notify_tx
+#include "generic/canserial.h" // canserial_set_invalid_bitrate
 #include "internal.h" // enable_pclock
 #include "sched.h" // DECL_INIT
 
@@ -112,8 +113,18 @@ make_btr(uint32_t sjw, uint32_t time_seg1, uint32_t time_seg2, uint32_t brp)
 static uint32_t
 compute_btr(uint32_t pclock, uint32_t bitrate)
 {
+    /*
+     * A truncated pclock / bitrate result silently programs a nearby bus rate,
+     * and the previous fallback encoded arbitrary default timing when no legal
+     * quanta count was found.  The host still sees CANBUS_FREQUENCY as the
+     * requested value, hiding that mismatch until arbitration or sampling
+     * becomes unreliable.  Accept only an exactly divisible clock and a timing
+     * tuple which fits every LPC CAN field.
+     */
+    if (!bitrate || pclock % bitrate)
+        return CAN_INVALID_BTR;
     uint32_t bit_clocks = pclock / bitrate;
-    uint32_t best_sample_error = ~0, best_brp = bit_clocks / 10;
+    uint32_t best_sample_error = ~0, best_brp = 0;
     uint32_t time_seg1 = 7, time_seg2 = 2;
     int qs;
     for (qs = 25; qs >= 8; qs--) {
@@ -149,6 +160,8 @@ compute_btr(uint32_t pclock, uint32_t bitrate)
         }
     }
 
+    if (best_sample_error == (uint32_t)~0)
+        return CAN_INVALID_BTR;
     return make_btr(2, time_seg1, time_seg2, best_brp);
 }
 
@@ -297,8 +310,13 @@ can_init(void)
     gpio_peripheral(GPIO_Tx, CAN_FUNCTION_Tx, 0);
 
     LPC_CANAF->AFMR = CANAF_AFMR_ACCBP;
-    LPC_CANx->BTR = compute_btr(get_pclock_frequency(PCLK_CANx)
-                                , CONFIG_CANBUS_FREQUENCY);
+    uint32_t btr = compute_btr(get_pclock_frequency(PCLK_CANx)
+                               , CONFIG_CANBUS_FREQUENCY);
+    if (btr == CAN_INVALID_BTR) {
+        canserial_set_invalid_bitrate();
+        return;
+    }
+    LPC_CANx->BTR = btr;
     LPC_CANx->EWL = CAN_ERROR_WARNING_LIMIT;
 
     // Clear any stale interrupt state and enter normal operating mode.

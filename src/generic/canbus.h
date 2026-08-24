@@ -22,6 +22,8 @@ struct canbus_msg {
 #define CANMSG_ID_RTR (1u<<30)
 #define CANMSG_ID_EFF (1u<<31)
 
+#define CAN_INVALID_BTR (~0u)
+
 #define CANMSG_DATA_LEN(msg) ((msg)->dlc > 8 ? 8 : (msg)->dlc)
 
 static inline void
