@@ -182,7 +182,17 @@ class SerialReader:
                 bus = can.interface.Bus(channel=canbus_iface,
                                         can_filters=filters,
                                         bustype='socketcan')
-                bus.send(set_id_msg)
+                # python-can defines a missing timeout as permission to block
+                # indefinitely while the local transmit queue is unavailable.
+                # That would run in the reactor thread and prevent both the
+                # surrounding 90-second connection deadline and every other
+                # reactor callback from making progress.  Bound only this
+                # individual queue attempt; a timeout raises CanError and uses
+                # the existing cleanup, pause, and retry path.  One second is
+                # deliberately much longer than normal SocketCAN queue latency
+                # while still keeping a wedged interface subordinate to
+                # Klipper's connection deadline.
+                bus.send(set_id_msg, timeout=1.0)
             except (can.CanError, os.error, IOError) as e:
                 if bus is not None:
                     # Socket construction and the first assignment send share
