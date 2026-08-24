@@ -133,6 +133,15 @@ class SerialReader:
         return True
     def connect_canbus(self, canbus_uuid, canbus_nodeid, canbus_iface="can0"):
         import can # XXX
+        # Most callers obtain a checked id from canbus_ids, but console and
+        # diagnostic users can reach this transport entry point directly.  The
+        # assignment command has only one payload byte for the node id, and the
+        # corresponding standard CAN ids are calculated from the same range.
+        # Validate before either representation is built so an invalid caller
+        # receives a normal Klipper connection error instead of an incidental
+        # python-can packing or arbitration-id exception.
+        if canbus_nodeid < 0 or canbus_nodeid > 0xff:
+            self._error("Invalid CAN nodeid")
         txid = canbus_nodeid * 2 + 256
         filters = [{"can_id": txid+1, "can_mask": 0x7ff, "extended": False}]
         # Prep for SET_NODEID command
