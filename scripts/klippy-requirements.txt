@@ -10,8 +10,9 @@ greenlet==3.3.2 ; python_version >= '3.12'
 cffi==1.14.6 ; python_version < '3.12'
 cffi==2.1.1 ; python_version >= '3.12'
 # Jinja2 is used by gcode_macro.py
-Jinja2==2.11.3
-markupsafe==1.1.1       # Needed by Jinja2
+Jinja2==2.11.3 ; python_version < '3.7'
+markupsafe==1.1.1 ; python_version < '3.7'
+Jinja2==3.1.6 ; python_version >= '3.7'
 # pyserial is used by serialhdl.py (for USB and UART mcu connections)
 pyserial==3.4
 # python-can is used by serialhdl.py (for canbus mcu connections)

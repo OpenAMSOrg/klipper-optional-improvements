@@ -5,11 +5,25 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import traceback, logging, ast, copy, json
 import jinja2
+from jinja2.sandbox import SandboxedEnvironment
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
 
 
 ######################################################################
 # Template handling
 ######################################################################
+
+class GCodeSandbox(SandboxedEnvironment):
+    # Macro templates may come from configuration exposed to API clients
+    def is_safe_attribute(self, obj, attr, value):
+        # Mitigate legacy-Jinja format and attr-filter sandbox escapes.
+        if isinstance(obj, string_types) and attr in ('format', 'format_map'):
+            return False
+        return super(GCodeSandbox, self).is_safe_attribute(obj, attr, value)
 
 # Wrapper for access to printer object get_status() methods
 class GetStatusWrapper:
@@ -80,7 +94,8 @@ class TemplateWrapper:
 class PrinterGCodeMacro:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.env = jinja2.Environment('{%', '%}', '{', '}')
+        self.env = GCodeSandbox('{%', '%}', '{', '}')
+        self.env.filters.pop('attr', None)
     def load_template(self, config, option, default=None):
         name = "%s:%s" % (config.get_name(), option)
         if default is None:
