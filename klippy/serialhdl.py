@@ -50,7 +50,22 @@ class SerialReader:
             if response.notify_id:
                 params = {'#sent_time': response.sent_time,
                           '#receive_time': response.receive_time}
-                completion = self.pending_notifications.pop(response.notify_id)
+                # Notification ids are allocated by this host and returned by
+                # serialqueue when the corresponding message is acknowledged;
+                # they are not MCU-controlled dictionary values.  Even so, a
+                # duplicate or stale completion must not raise KeyError out of
+                # this function: _bg_thread is the sole receiver for all later
+                # MCU traffic, so losing it would turn one bookkeeping
+                # inconsistency into a silent, permanent connection stall.
+                # Report the violated invariant and discard only the orphaned
+                # completion, matching the containment used for an invalid MCU
+                # message below.
+                completion = self.pending_notifications.pop(
+                    response.notify_id, None)
+                if completion is None:
+                    logging.error("%sUnknown serial notification id %d",
+                                  self.warn_prefix, response.notify_id)
+                    continue
                 self.reactor.async_complete(completion, params)
                 continue
             try:
