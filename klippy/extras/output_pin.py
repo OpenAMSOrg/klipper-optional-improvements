@@ -3,7 +3,7 @@
 # Copyright (C) 2017-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, ast
+import logging, ast, math
 from .display import display
 
 
@@ -245,6 +245,8 @@ class PrinterOutputPin:
     def _template_update(self, text):
         try:
             value = float(text)
+            if math.isnan(value) or math.isinf(value):
+                raise ValueError("non-finite value")
         except ValueError as e:
             logging.exception("output_pin template render error")
             value = 0.

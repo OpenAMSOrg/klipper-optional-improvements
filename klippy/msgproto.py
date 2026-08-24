@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import json, zlib, logging
+import json, zlib, logging, math
 
 DefaultMessages = {
     "identify_response offset=%u data=%.*s": 0,
@@ -456,6 +456,11 @@ class MessageParser:
                         name, self.config[name])
         return value
     def get_constant_float(self, name, default=sentinel):
-        return self.get_constant(name, default, parser=float)
+        def parse_float(value):
+            value = float(value)
+            if math.isnan(value) or math.isinf(value):
+                raise ValueError("non-finite value")
+            return value
+        return self.get_constant(name, default, parser=parse_float)
     def get_constant_int(self, name, default=sentinel):
         return self.get_constant(name, default, parser=int)

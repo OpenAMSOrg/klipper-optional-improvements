@@ -134,30 +134,26 @@ class GCodeMove:
     def cmd_G1(self, gcmd):
         # Move
         params = gcmd.get_command_parameters()
-        try:
-            for axis, pos in self.axis_map.items():
-                if axis in params:
-                    v = float(params[axis])
-                    absolute_coord = self.absolute_coord
-                    if axis == 'E':
-                        v *= self.extrude_factor
-                        if not self.allow_absolute_extrude:
-                            absolute_coord = False
-                    if not absolute_coord:
-                        # value relative to position of last move
-                        self.last_position[pos] += v
-                    else:
-                        # value relative to base coordinate position
-                        self.last_position[pos] = v + self.base_position[pos]
-            if 'F' in params:
-                gcode_speed = float(params['F'])
-                if gcode_speed <= 0.:
-                    raise gcmd.error("Invalid speed in '%s'"
-                                     % (gcmd.get_commandline(),))
-                self.speed = gcode_speed * self.speed_factor
-        except ValueError as e:
-            raise gcmd.error("Unable to parse move '%s'"
-                             % (gcmd.get_commandline(),))
+        parsed_axes = {axis: gcmd.get_float(axis)
+                       for axis in self.axis_map if axis in params}
+        gcode_speed = None
+        if 'F' in params:
+            gcode_speed = gcmd.get_float('F', above=0.)
+        for axis, v in parsed_axes.items():
+            pos = self.axis_map[axis]
+            absolute_coord = self.absolute_coord
+            if axis == 'E':
+                v *= self.extrude_factor
+                if not self.allow_absolute_extrude:
+                    absolute_coord = False
+            if not absolute_coord:
+                # value relative to position of last move
+                self.last_position[pos] += v
+            else:
+                # value relative to base coordinate position
+                self.last_position[pos] = v + self.base_position[pos]
+        if gcode_speed is not None:
+            self.speed = gcode_speed * self.speed_factor
         self.move_with_transform(self.last_position, self.speed)
     # G-Code coordinate manipulation
     def cmd_G20(self, gcmd):

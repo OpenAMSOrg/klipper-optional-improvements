@@ -3,7 +3,14 @@
 # Copyright (C) 2016-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, re, logging, collections, shlex, operator
+import os, re, logging, collections, shlex, operator, math
+
+def parse_float(value):
+    # Non-finite values bypass normal minval and maxval comparisons
+    value = float(value)
+    if math.isnan(value) or math.isinf(value):
+        raise ValueError("non-finite value")
+    return value
 
 class CommandError(Exception):
     pass
@@ -92,7 +99,7 @@ class GCodeCommand:
         return self.get(name, default, parser=int, minval=minval, maxval=maxval)
     def get_float(self, name, default=sentinel, minval=None, maxval=None,
                   above=None, below=None):
-        return self.get(name, default, parser=float, minval=minval,
+        return self.get(name, default, parser=parse_float, minval=minval,
                         maxval=maxval, above=above, below=below)
 
 # Parse and dispatch G-Code commands

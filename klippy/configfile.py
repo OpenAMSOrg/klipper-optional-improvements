@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, glob, re, time, logging, configparser, io
+import sys, os, glob, re, time, logging, configparser, io, math
 
 error = configparser.Error
 
@@ -67,7 +67,13 @@ class ConfigWrapper:
                                  minval, maxval, note_valid=note_valid)
     def getfloat(self, option, default=sentinel, minval=None, maxval=None,
                  above=None, below=None, note_valid=True):
-        return self._get_wrapper(self.fileconfig.getfloat, option, default,
+        def parse_float(section, option):
+            # Non-finite values bypass normal range comparisons
+            value = self.fileconfig.getfloat(section, option)
+            if math.isnan(value) or math.isinf(value):
+                raise ValueError("non-finite value")
+            return value
+        return self._get_wrapper(parse_float, option, default,
                                  minval, maxval, above, below,
                                  note_valid=note_valid)
     def getboolean(self, option, default=sentinel, note_valid=True):
@@ -86,6 +92,13 @@ class ConfigWrapper:
         return choices[c]
     def getlists(self, option, default=sentinel, seps=(',',), count=None,
                  parser=str, note_valid=True):
+        if parser is float:
+            def parse_float(value):
+                value = float(value)
+                if math.isnan(value) or math.isinf(value):
+                    raise ValueError("non-finite value")
+                return value
+            parser = parse_float
         def lparser(value, pos):
             if len(value.strip()) == 0:
                 # Return an empty list instead of [''] for empty string
@@ -114,8 +127,13 @@ class ConfigWrapper:
                              parser=int, note_valid=note_valid)
     def getfloatlist(self, option, default=sentinel, sep=',', count=None,
                      note_valid=True):
+        def parse_float(value):
+            value = float(value)
+            if math.isnan(value) or math.isinf(value):
+                raise ValueError("non-finite value")
+            return value
         return self.getlists(option, default, seps=(sep,), count=count,
-                             parser=float, note_valid=note_valid)
+                             parser=parse_float, note_valid=note_valid)
     def getsection(self, section):
         return ConfigWrapper(self.printer, self.fileconfig,
                              self.access_tracking, section)

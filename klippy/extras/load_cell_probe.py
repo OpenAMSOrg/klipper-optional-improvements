@@ -61,6 +61,8 @@ class ParamHelper:
         return self.name.upper() if gcmd else self.name
 
     def _validate_float(self, description, error, value, above, below):
+        if math.isnan(value) or math.isinf(value):
+            raise error("%s must be finite" % (description,))
         above = above or self.above
         if above is not None and value <= above:
             raise error("%s must be above %s" % (description, above))

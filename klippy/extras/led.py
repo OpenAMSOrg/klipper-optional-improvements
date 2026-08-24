@@ -3,7 +3,7 @@
 # Copyright (C) 2019-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging
+import logging, math
 from . import output_pin
 
 # Helper code for common LED initialization and control
@@ -49,8 +49,10 @@ class LEDHelper:
         self.need_transmit = True
     def _template_update(self, index, text):
         try:
-            parts = [max(0., min(1., float(f)))
-                     for f in text.split(',', 4)]
+            parts = [float(f) for f in text.split(',', 4)]
+            if any(math.isnan(f) or math.isinf(f) for f in parts):
+                raise ValueError("non-finite value")
+            parts = [max(0., min(1., f)) for f in parts]
         except ValueError as e:
             logging.exception("led template render error")
             parts = []

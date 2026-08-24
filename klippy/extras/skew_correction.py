@@ -106,7 +106,9 @@ class PrinterSkew:
                 try:
                     lengths = lengths.strip().split(",", 2)
                     lengths = [float(l.strip()) for l in lengths]
-                    if len(lengths) != 3:
+                    if (len(lengths) != 3
+                        or any(math.isnan(l) or math.isinf(l)
+                               for l in lengths)):
                         raise Exception
                 except Exception:
                     raise gcmd.error(

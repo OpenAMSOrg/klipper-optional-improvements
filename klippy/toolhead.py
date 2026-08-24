@@ -381,6 +381,8 @@ class ToolHead:
     def get_position(self):
         return list(self.commanded_pos)
     def set_position(self, newpos, homing_axes=""):
+        if any(math.isnan(pos) or math.isinf(pos) for pos in newpos):
+            raise self.printer.command_error("Invalid toolhead position")
         self.flush_step_generation()
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trapq_set_position(self.trapq, self.print_time,
@@ -393,6 +395,9 @@ class ToolHead:
         if last_move is not None:
             last_move.limit_next_junction_speed(speed)
     def move(self, newpos, speed):
+        if ((math.isnan(speed) or math.isinf(speed)) or speed <= 0.
+            or any(math.isnan(pos) or math.isinf(pos) for pos in newpos)):
+            raise self.printer.command_error("Invalid toolhead move")
         move = Move(self, self.commanded_pos, newpos, speed)
         if not move.move_d:
             return

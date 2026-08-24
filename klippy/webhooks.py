@@ -3,7 +3,7 @@
 # Copyright (C) 2020 Eric Callahan <arksine.code@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license
-import logging, socket, os, sys, errno, collections
+import logging, socket, os, sys, errno, collections, math
 import gcode
 
 try:
@@ -84,7 +84,10 @@ class WebRequest:
         return self.get(item, default, types=(int,))
 
     def get_float(self, item, default=Sentinel):
-        return float(self.get(item, default, types=(int, float)))
+        value = float(self.get(item, default, types=(int, float)))
+        if math.isnan(value) or math.isinf(value):
+            raise WebRequestError("Invalid Argument Value [%s]" % (item,))
+        return value
 
     def get_dict(self, item, default=Sentinel):
         return self.get(item, default, types=(dict,))
