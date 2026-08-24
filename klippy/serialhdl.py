@@ -143,7 +143,21 @@ class SerialReader:
         if canbus_nodeid < 0 or canbus_nodeid > 0xff:
             self._error("Invalid CAN nodeid")
         txid = canbus_nodeid * 2 + 256
-        filters = [{"can_id": txid+1, "can_mask": 0x7ff, "extended": False}]
+        # python-can adds CAN_EFF_FLAG to the kernel mask when "extended" is
+        # present, but a bare 11-bit mask still permits a remote-transmission
+        # request with the same identifier.  serialqueue would discard that
+        # frame after waking its poll thread, and Linux would place this socket
+        # on a general receive-filter list.  Include CAN_RTR_FLAG in the mask so
+        # the subscription describes exactly one standard data-frame id.  In
+        # addition to rejecting the unused frame type in the kernel, this is
+        # the mask shape SocketCAN uses for its direct-indexed standard-id
+        # receive table.  That distinction matters here because Klipper opens
+        # one filtered raw socket per CAN MCU; a general-list lookup otherwise
+        # grows with the number of configured nodes on every received frame.
+        CAN_RTR_FLAG = 0x40000000
+        filters = [{"can_id": txid+1,
+                    "can_mask": 0x7ff | CAN_RTR_FLAG,
+                    "extended": False}]
         # Prep for SET_NODEID command
         try:
             uuid = int(canbus_uuid, 16)
