@@ -1476,9 +1476,26 @@ can2040_stop(struct can2040 *cd)
 void
 can2040_get_statistics(struct can2040 *cd, struct can2040_stats *stats)
 {
+    /*
+     * The PIO interrupt handler updates these counters asynchronously.  Plain
+     * memcpy followed by memcmp is not a synchronization mechanism: because
+     * cd->stats is not volatile, the compiler may combine or reuse loads and
+     * make the apparent stability check succeed with fields from different
+     * interrupt generations.  Read every 32-bit field through readl() so each
+     * access is both atomic on this MCU and visible to the compiler, then
+     * verify the snapshot against a second set of volatile reads.  Retrying on
+     * any change returns a mutually consistent set without holding off the
+     * latency-sensitive CAN interrupt.
+     */
     for (;;) {
-        memcpy(stats, &cd->stats, sizeof(*stats));
-        if (memcmp(stats, &cd->stats, sizeof(*stats)) == 0)
+        stats->rx_total = readl(&cd->stats.rx_total);
+        stats->tx_total = readl(&cd->stats.tx_total);
+        stats->tx_attempt = readl(&cd->stats.tx_attempt);
+        stats->parse_error = readl(&cd->stats.parse_error);
+        if (stats->rx_total == readl(&cd->stats.rx_total)
+            && stats->tx_total == readl(&cd->stats.tx_total)
+            && stats->tx_attempt == readl(&cd->stats.tx_attempt)
+            && stats->parse_error == readl(&cd->stats.parse_error))
             // Successfully copied data
             return;
         // Raced with irq handler update - retry copy
