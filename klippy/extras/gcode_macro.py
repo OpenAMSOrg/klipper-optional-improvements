@@ -9,8 +9,13 @@ from jinja2.sandbox import SandboxedEnvironment
 
 try:
     string_types = (basestring,)
+    integer_types = (int, long)
 except NameError:
     string_types = (str,)
+    integer_types = (int,)
+
+# Bound work and memory use from user supplied template expressions
+MAX_TEMPLATE_OUTPUT = 1024 * 1024
 
 
 ######################################################################
@@ -19,11 +24,29 @@ except NameError:
 
 class GCodeSandbox(SandboxedEnvironment):
     # Macro templates may come from configuration exposed to API clients
+    intercepted_binops = frozenset(['*', '**'])
+
     def is_safe_attribute(self, obj, attr, value):
         # Mitigate legacy-Jinja format and attr-filter sandbox escapes.
         if isinstance(obj, string_types) and attr in ('format', 'format_map'):
             return False
         return super(GCodeSandbox, self).is_safe_attribute(obj, attr, value)
+    def call_binop(self, context, operator, left, right):
+        if operator == '*':
+            sequence, count = left, right
+            if isinstance(right, (list, tuple) + string_types):
+                sequence, count = right, left
+            if (isinstance(sequence, (list, tuple) + string_types)
+                and isinstance(count, integer_types)
+                and count > 0 and len(sequence) * count > MAX_TEMPLATE_OUTPUT):
+                raise jinja2.exceptions.SecurityError(
+                    "template sequence expansion is too large")
+        elif (operator == '**' and isinstance(right, integer_types)
+              and abs(right) > 10000):
+            raise jinja2.exceptions.SecurityError(
+                "template exponent is too large")
+        return super(GCodeSandbox, self).call_binop(
+            context, operator, left, right)
 
 # Wrapper for access to printer object get_status() methods
 class GetStatusWrapper:
@@ -81,7 +104,16 @@ class TemplateWrapper:
         if context is None:
             context = self.create_template_context()
         try:
-            return str(self.template.render(context))
+            chunks = []
+            output_size = 0
+            for chunk in self.template.generate(context):
+                chunk = str(chunk)
+                output_size += len(chunk)
+                if output_size > MAX_TEMPLATE_OUTPUT:
+                    raise jinja2.exceptions.SecurityError(
+                        "template output is too large")
+                chunks.append(chunk)
+            return ''.join(chunks)
         except Exception as e:
             msg = "Error evaluating '%s': %s" % (
                 self.name, traceback.format_exception_only(type(e), e)[-1])
