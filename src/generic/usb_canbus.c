@@ -695,9 +695,42 @@ usb_req_set_configuration(struct usb_ctrlrequest *req)
 
 struct gs_host_config host_config;
 
+static int
+gs_validate_request(struct usb_ctrlrequest *req, uint_fast8_t direction,
+                    uint_fast16_t value, uint_fast16_t length)
+{
+    /*
+     * A USB control setup packet defines the direction and size of the data
+     * stage which follows it.  The handlers below use fixed C structures, so
+     * starting one of those transfers after accepting only bRequest can make
+     * the device and host disagree about which endpoint is sending and how
+     * many bytes remain.  In particular, accepting an IN request in an OUT
+     * handler can leave ep0 waiting for bytes that the host will never send,
+     * while accepting a short wLength can transfer beyond the host's stated
+     * buffer.  Either case can wedge the control endpoint until the USB
+     * connection is reset.
+     *
+     * The gs_usb requests implemented here all have one exact transfer shape.
+     * This implementation also advertises one interface containing one CAN
+     * channel, both numbered zero.  Validate all of those protocol invariants
+     * before installing any ep0 transfer state; a stall lets the USB host
+     * recover using the standard control-transfer error path.
+     */
+    uint_fast8_t request_type = direction | USB_TYPE_VENDOR
+        | USB_RECIP_INTERFACE;
+    if (req->bRequestType != request_type || req->wValue != value
+        || req->wIndex || req->wLength != length) {
+        usb_do_stall();
+        return -1;
+    }
+    return 0;
+}
+
 static void
 gs_breq_host_format(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_OUT, 1, sizeof(host_config)))
+        return;
     // Like candlightfw, little-endian is always used.  Read and ignore value.
     usb_do_xfer(&host_config, sizeof(host_config), UX_READ);
 }
@@ -710,6 +743,8 @@ static const struct gs_device_config device_config PROGMEM = {
 static void
 gs_breq_device_config(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_IN, 1, sizeof(device_config)))
+        return;
     usb_do_xfer((void*)&device_config, sizeof(device_config), UX_SEND);
 }
 
@@ -730,6 +765,8 @@ static const struct gs_device_bt_const bt_const PROGMEM = {
 static void
 gs_breq_bt_const(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_IN, 0, sizeof(bt_const)))
+        return;
     usb_do_xfer((void*)&bt_const, sizeof(bt_const), UX_SEND);
 }
 
@@ -738,6 +775,9 @@ struct gs_device_bittiming device_bittiming;
 static void
 gs_breq_bittiming(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_OUT, 0,
+                            sizeof(device_bittiming)))
+        return;
     // Bit timing is ignored for now
     usb_do_xfer(&device_bittiming, sizeof(device_bittiming), UX_READ);
 }
@@ -747,6 +787,8 @@ struct gs_device_mode device_mode;
 static void
 gs_breq_mode(struct usb_ctrlrequest *req)
 {
+    if (gs_validate_request(req, USB_DIR_OUT, 0, sizeof(device_mode)))
+        return;
     // Mode is ignored for now
     usb_do_xfer(&device_mode, sizeof(device_mode), UX_READ);
 }
