@@ -4,7 +4,7 @@
 # Copyright (C) 2016-2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging, ast, configparser
+import os, logging, ast, configparser, tempfile
 
 class SaveVariables:
     def __init__(self, config):
@@ -15,7 +15,9 @@ class SaveVariables:
         self.executor = aio.allocate_executor("save_variables")
         try:
             if not os.path.exists(self.filename):
-                open(self.filename, "w").close()
+                fd = os.open(self.filename, os.O_WRONLY | os.O_CREAT
+                             | os.O_EXCL, 0o600)
+                os.close(fd)
             self.loadVariables()
         except self.printer.command_error as e:
             raise config.error(str(e))
@@ -54,8 +56,23 @@ class SaveVariables:
             varfile.set('Variables', name, repr(val))
         try:
             def write_out():
-                with open(self.filename, "w") as f:
-                    varfile.write(f)
+                # Use the target directory so the final rename is atomic
+                directory = os.path.dirname(os.path.abspath(self.filename))
+                fd, temp_name = tempfile.mkstemp(
+                    prefix='.' + os.path.basename(self.filename) + '.',
+                    dir=directory, text=True)
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        varfile.write(f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.rename(temp_name, self.filename)
+                except:
+                    try:
+                        os.unlink(temp_name)
+                    except OSError:
+                        pass
+                    raise
             self.executor.submit(write_out)
         except:
             msg = "Unable to save variable"

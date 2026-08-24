@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, glob, re, time, logging, configparser, io, math
+import sys, os, glob, re, time, logging, configparser, io, math, tempfile, errno
 
 error = configparser.Error
 
@@ -380,6 +380,7 @@ class ConfigAutoSave:
             msg = "Unable to read existing config on SAVE_CONFIG"
             logging.exception(msg)
             raise gcmd.error(msg)
+        original_data = data
         regular_data, old_autosave_data = self._find_autosave_data(data)
         regular_data = self._strip_duplicates(regular_data, self.fileconfig)
         data = regular_data.rstrip() + autosave_data
@@ -399,20 +400,50 @@ class ConfigAutoSave:
         # Determine filenames
         datestr = time.strftime("-%Y%m%d_%H%M%S")
         backup_name = cfgname + datestr
-        temp_name = cfgname + "_autosave"
         if cfgname.endswith(".cfg"):
             backup_name = cfgname[:-4] + datestr + ".cfg"
-            temp_name = cfgname[:-4] + "_autosave.cfg"
-        # Create new config file with temporary name and swap with main config
+        # Create a backup and atomically replace the main config file
         logging.info("SAVE_CONFIG to '%s' (backup in '%s')",
                      cfgname, backup_name)
+        temp_name = None
         try:
-            f = open(temp_name, 'w')
-            f.write(data)
-            f.close()
-            os.rename(cfgname, backup_name)
+            cfg_stat = os.stat(cfgname)
+            cfg_mode = cfg_stat.st_mode & 0o777
+            cfg_dir = os.path.dirname(os.path.abspath(cfgname))
+            temp_fd, temp_name = tempfile.mkstemp(
+                prefix='.' + os.path.basename(cfgname) + '.', dir=cfg_dir,
+                text=True)
+            with os.fdopen(temp_fd, 'w') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temp_name, cfg_mode)
+            candidate = backup_name
+            suffix = 1
+            while True:
+                try:
+                    backup_fd = os.open(
+                        candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        cfg_mode)
+                    backup_name = candidate
+                    break
+                except OSError as e:
+                    if e.errno != errno.EEXIST:
+                        raise
+                    candidate = "%s.%d" % (backup_name, suffix)
+                    suffix += 1
+            with os.fdopen(backup_fd, 'w') as f:
+                f.write(original_data)
+                f.flush()
+                os.fsync(f.fileno())
             os.rename(temp_name, cfgname)
+            temp_name = None
         except:
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
             msg = "Unable to write config file during SAVE_CONFIG"
             logging.exception(msg)
             raise gcmd.error(msg)
