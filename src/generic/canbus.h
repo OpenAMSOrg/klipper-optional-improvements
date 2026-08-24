@@ -12,8 +12,15 @@ struct canbus_msg {
     };
 };
 
-#define CANMSG_ID_RTR (1<<30)
-#define CANMSG_ID_EFF (1<<31)
+/*
+ * CAN identifiers and their SocketCAN-compatible flags are stored together in
+ * a uint32_t.  Keep the flag constants unsigned as well: shifting a signed
+ * integer into bit 31 is undefined by C, so an optimizer would not be required
+ * to preserve the extended-frame test even though common compilers currently
+ * produce the intended 0x80000000 value.
+ */
+#define CANMSG_ID_RTR (1u<<30)
+#define CANMSG_ID_EFF (1u<<31)
 
 #define CANMSG_DATA_LEN(msg) ((msg)->dlc > 8 ? 8 : (msg)->dlc)
 
