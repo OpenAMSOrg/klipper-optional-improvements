@@ -29,7 +29,9 @@ class Move:
         velocity = min(speed, toolhead.max_velocity)
         self.is_kinematic_move = True
         self.axes_d = axes_d = [ep - sp for sp, ep in zip(start_pos, end_pos)]
-        self.move_d = move_d = math.sqrt(sum([d*d for d in axes_d[:3]]))
+        self.move_d = move_d = math.sqrt(
+            axes_d[0] * axes_d[0] + axes_d[1] * axes_d[1]
+            + axes_d[2] * axes_d[2])
         if move_d < .000000001:
             # Extrude only move
             self.end_pos = ((start_pos[0], start_pos[1], start_pos[2])
@@ -50,14 +52,14 @@ class Move:
         # delta_v2 is the maximum amount of this squared-velocity that
         # can change in this move.
         self.max_start_v2 = 0.
-        self.max_cruise_v2 = velocity**2
+        self.max_cruise_v2 = velocity * velocity
         self.delta_v2 = 2.0 * move_d * self.accel
         self.next_junction_v2 = 999999999.9
         # Setup for minimum_cruise_ratio checks
         self.max_mcr_start_v2 = 0.
         self.mcr_delta_v2 = 2.0 * move_d * toolhead.mcr_pseudo_accel
     def limit_speed(self, speed, accel):
-        speed2 = speed**2
+        speed2 = speed * speed
         if speed2 < self.max_cruise_v2:
             self.max_cruise_v2 = speed2
             self.min_move_t = self.move_d / speed
@@ -65,7 +67,7 @@ class Move:
         self.delta_v2 = 2.0 * self.move_d * self.accel
         self.mcr_delta_v2 = min(self.mcr_delta_v2, self.delta_v2)
     def limit_next_junction_speed(self, speed):
-        self.next_junction_v2 = min(self.next_junction_v2, speed**2)
+        self.next_junction_v2 = min(self.next_junction_v2, speed * speed)
     def move_error(self, msg="Move out of range"):
         ep = self.end_pos
         m = "%s: %.3f %.3f %.3f [%.3f]" % (msg, ep[0], ep[1], ep[2], ep[3])
