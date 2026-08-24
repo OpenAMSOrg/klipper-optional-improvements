@@ -93,7 +93,12 @@
 struct fdcan_fifo {
     uint32_t id_section;
     uint32_t dlc_section;
+#if CONFIG_MACH_STM32H7
+    uint32_t data[8 / 4];
+#else
+    /* STM32G0/G4 implement a fixed three-element, 64-byte-data layout. */
     uint32_t data[64 / 4];
+#endif
 };
 
 #define FDCAN_XTD (1<<30)
@@ -102,10 +107,19 @@ struct fdcan_fifo {
 struct fdcan_msg_ram {
     uint32_t FLS[28]; // Filter list standard
     uint32_t FLE[16]; // Filter list extended
+#if CONFIG_MACH_STM32H7
+    struct fdcan_fifo RXF0[16];
+#else
     struct fdcan_fifo RXF0[3];
+#endif
     struct fdcan_fifo RXF1[3];
     uint32_t TEF[6]; // Tx event FIFO
+#if CONFIG_MACH_STM32H7
+    struct fdcan_fifo TXFIFO[16];
+    uint32_t unused[22];
+#else
     struct fdcan_fifo TXFIFO[3];
+#endif
 };
 
 struct fdcan_ram_layout {
@@ -427,10 +441,25 @@ can_init(void)
     /* Setup message RAM addresses */
     uint32_t f0sa = (uint32_t)MSG_RAM.RXF0 - SRAMCAN_BASE;
     SOC_CAN->RXF0C = f0sa | (ARRAY_SIZE(MSG_RAM.RXF0) << FDCAN_RXF0C_F0S_Pos);
-    SOC_CAN->RXESC = (7 << FDCAN_RXESC_F1DS_Pos) | (7 << FDCAN_RXESC_F0DS_Pos);
+    /*
+     * Klipper and gs_usb use classical CAN exclusively, so every receive and
+     * transmit element needs eight data bytes, not the reset-independent
+     * 64-byte CAN-FD maximum.  The smaller element size expands each active
+     * FIFO from three records to sixteen inside the same 212-word
+     * per-controller message-RAM partition.  Preserving that total is
+     * significant on dual STM32 controllers because fdcan2 begins immediately
+     * after fdcan1.
+     *
+     * Deeper receive buffering tolerates interrupt latency without overwriting
+     * commands, while deeper transmit buffering lets the routing task submit a
+     * burst before it needs the demand-driven capacity interrupt.  The unused
+     * FIFO 1 retains its prior entry count, and explicit tail padding prevents
+     * this optimization from moving the second controller's base address.
+     */
+    SOC_CAN->RXESC = 0;
     uint32_t tbsa = (uint32_t)MSG_RAM.TXFIFO - SRAMCAN_BASE;
     SOC_CAN->TXBC = tbsa | (ARRAY_SIZE(MSG_RAM.TXFIFO) << FDCAN_TXBC_TFQS_Pos);
-    SOC_CAN->TXESC = 7 << FDCAN_TXESC_TBDS_Pos;
+    SOC_CAN->TXESC = 0;
 #endif
 
     /* Leave the initialisation mode */

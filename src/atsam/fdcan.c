@@ -57,7 +57,7 @@
 struct fdcan_fifo {
     uint32_t id_section;
     uint32_t dlc_section;
-    uint32_t data[64 / 4];
+    uint32_t data[8 / 4];
 };
 
 #define FDCAN_XTD (1<<30)
@@ -66,10 +66,11 @@ struct fdcan_fifo {
 struct fdcan_msg_ram {
     uint32_t FLS[28]; // Filter list standard
     uint32_t FLE[16]; // Filter list extended
-    struct fdcan_fifo RXF0[3];
+    struct fdcan_fifo RXF0[16];
     struct fdcan_fifo RXF1[3];
     uint32_t TEF[6]; // Tx event FIFO
-    struct fdcan_fifo TXFIFO[3];
+    struct fdcan_fifo TXFIFO[16];
+    uint32_t unused[22];
 };
 
 // Message ram is in DTCM - locate it there to avoid cache.
@@ -401,13 +402,26 @@ can_init(void)
         - (CCFG_CANxDMABA_Msk & CCFG_CANxDMABA);
     CANx->MCAN_RXF0C = f0sa
         | (ARRAY_SIZE(MSG_RAM.RXF0) << MCAN_RXF0C_F0S_Pos);
-    CANx->MCAN_RXESC = (7 << MCAN_RXESC_F1DS_Pos)
-        | (7 << MCAN_RXESC_F0DS_Pos);
+    /*
+     * Klipper and gs_usb use classical CAN exclusively, so every receive and
+     * transmit element needs eight data bytes, not the reset-independent
+     * 64-byte CAN-FD maximum.  The smaller element size expands each active
+     * FIFO from three records to sixteen while retaining the existing 212-word
+     * message-RAM allocation.
+     *
+     * Deeper receive buffering tolerates interrupt latency without overwriting
+     * commands, while deeper transmit buffering lets the routing task submit a
+     * burst before it needs the demand-driven capacity interrupt.  FIFO 1
+     * retains its prior entry count, and explicit tail padding documents and
+     * preserves the total allocation instead of silently changing this
+     * DMA-visible memory contract.
+     */
+    CANx->MCAN_RXESC = 0;
     uint32_t tbsa = (uint32_t)MSG_RAM.TXFIFO
         - (CCFG_CANxDMABA_Msk & CCFG_CANxDMABA);
     CANx->MCAN_TXBC = tbsa
         | (ARRAY_SIZE(MSG_RAM.TXFIFO) << MCAN_TXBC_TFQS_Pos);
-    CANx->MCAN_TXESC = 7 << MCAN_TXESC_TBDS_Pos;
+    CANx->MCAN_TXESC = 0;
 
     /* Leave the initialisation mode */
     CANx->MCAN_CCCR &= ~MCAN_CCCR_CCE;
