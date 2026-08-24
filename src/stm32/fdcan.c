@@ -174,13 +174,29 @@ canhw_set_filter(uint32_t id)
     can_filter(1, id);
     can_filter(2, id + 1);
 
+    /*
+     * The standard-id filter list does not reject extended frames; the reset
+     * global-filter action routes non-matching extended identifiers to FIFO 0.
+     * A remote frame can also match one of the standard identifiers above even
+     * though canserial consumes data frames only.  Both cases spend an entry in
+     * the three-element receive FIFO and invoke the interrupt handler before
+     * software discards them, so unrelated traffic can crowd out a command.
+     * Reject remote frames globally and select the explicit reject action for
+     * both non-matching identifier formats.  This function returns above when
+     * CONFIG_CANBUS_FILTER is disabled, preserving arbitrary frame forwarding
+     * for USB-to-CAN bridge builds.
+     */
 #if CONFIG_MACH_STM32G0 || CONFIG_MACH_STM32G4
     SOC_CAN->RXGFC = ((id ? 3 : 1) << FDCAN_RXGFC_LSS_Pos
+                      | FDCAN_RXGFC_RRFE | FDCAN_RXGFC_RRFS
+                      | 0x02 << FDCAN_RXGFC_ANFE_Pos
                       | 0x02 << FDCAN_RXGFC_ANFS_Pos);
 #elif CONFIG_MACH_STM32H7
     uint32_t flssa = (uint32_t)MSG_RAM.FLS - SRAMCAN_BASE;
     SOC_CAN->SIDFC = flssa | ((id ? 3 : 1) << FDCAN_SIDFC_LSS_Pos);
-    SOC_CAN->GFC = 0x02 << FDCAN_GFC_ANFS_Pos;
+    SOC_CAN->GFC = (FDCAN_GFC_RRFE | FDCAN_GFC_RRFS
+                    | 0x02 << FDCAN_GFC_ANFE_Pos
+                    | 0x02 << FDCAN_GFC_ANFS_Pos);
 #endif
 
     /* Leave the initialisation mode for the filter */
