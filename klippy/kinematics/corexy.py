@@ -71,7 +71,15 @@ class CoreXYKinematics:
                 raise move.move_error()
     def check_move(self, move):
         limits = self.limits
-        xpos, ypos = move.end_pos[:2]
+        # Move.end_pos is already an immutable tuple, so slicing its first two
+        # coordinates creates another tuple solely to unpack it immediately.
+        # check_move() runs for every submitted CoreXY move, including the
+        # overwhelmingly common in-range XY case which returns below without
+        # any other allocation.  Read the two coordinates directly to keep that
+        # fast path allocation-free; the complete tuple remains available to
+        # _check_endstops() if either broad XY bound actually fails.
+        xpos = move.end_pos[0]
+        ypos = move.end_pos[1]
         if (xpos < limits[0][0] or xpos > limits[0][1]
             or ypos < limits[1][0] or ypos > limits[1][1]):
             self._check_endstops(move)
