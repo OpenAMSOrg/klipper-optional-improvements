@@ -219,8 +219,20 @@ CAN_IRQHandler(void)
     if (ir & CAN_IE_RF0NE) {
         CANx->IR.reg = CAN_IE_RF0NE;
 
-        uint32_t rxf0s = CANx->RXF0S.reg;
-        if (rxf0s & CAN_RXF0S_F0FL_Msk) {
+        /*
+         * RF0N reports that FIFO 0 transitioned to containing new data; it is
+         * not one interrupt record per FIFO element.  Several frames can arrive
+         * before this handler runs.  After RF0N is cleared, acknowledging only
+         * the oldest element may leave a quiet trailing frame in the FIFO with
+         * no new transition to raise another interrupt.  Re-read the hardware
+         * fill level after every acknowledgement and drain the complete batch.
+         * Acknowledging by the current get index preserves receive order while
+         * promptly returning every one of the three scarce FIFO slots.
+         */
+        for (;;) {
+            uint32_t rxf0s = CANx->RXF0S.reg;
+            if (!(rxf0s & CAN_RXF0S_F0FL_Msk))
+                break;
             // Read and ack data packet
             uint32_t idx = (rxf0s & CAN_RXF0S_F0GI_Msk) >> CAN_RXF0S_F0GI_Pos;
             struct fdcan_fifo *rxf0 = &MSG_RAM.RXF0[idx];
