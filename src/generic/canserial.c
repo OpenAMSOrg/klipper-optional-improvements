@@ -59,6 +59,7 @@ static struct canbus_data {
     // Rx data
     struct task_wake rx_wake;
     uint8_t receive_pos;
+    // Single-producer IRQ ring; publish indexes only after slot data is stable
     uint32_t admin_pull_pos, admin_push_pos;
 
     // Transfer buffers
@@ -369,15 +370,22 @@ canserial_process_data(struct canbus_msg *msg)
          * rollover, which is safe because that distance is bounded by this
          * eight-entry queue.
          */
-        if (pushp - CanData.admin_pull_pos
-            >= ARRAY_SIZE(CanData.admin_queue))
+        uint32_t pullp = readl(&CanData.admin_pull_pos);
+        if (pushp - pullp >= ARRAY_SIZE(CanData.admin_queue))
             // No space - drop message
             return;
         uint32_t pos = pushp % ARRAY_SIZE(CanData.admin_queue);
         memcpy(&CanData.admin_queue[pos], msg, sizeof(*msg));
         if (is_query)
             writeb(&CanData.query_queued, 1);
-        CanData.admin_push_pos = pushp + 1;
+        /*
+         * The task treats push_pos as proof that the complete queue slot is
+         * readable.  Use the I/O accessor as a compiler release barrier so the
+         * structure copy can not move after that publication.  This is an SPSC
+         * ring: only this receive interrupt advances push_pos, while only the
+         * task advances pull_pos, so no read-modify-write lock is required.
+         */
+        writel(&CanData.admin_push_pos, pushp + 1);
         canserial_notify_rx();
     }
 }
@@ -430,7 +438,10 @@ canserial_rx_task(void)
             if (msg->dlc && msg->data[0] == CANBUS_CMD_QUERY_UNASSIGNED)
                 writeb(&CanData.query_queued, 0);
         }
-        CanData.admin_pull_pos = pullp + 1;
+        /*
+         * Return this slot only after task-side processing no longer uses it.
+         */
+        writel(&CanData.admin_pull_pos, pullp + 1);
     }
 
     /*

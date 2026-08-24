@@ -137,6 +137,7 @@ static struct usbcan_data {
     struct gs_host_frame host_frames[16];
 
     // Data from physical canbus interface
+    // Single-producer IRQ ring; indexes publish ownership across contexts
     uint32_t canhw_pull_pos, canhw_push_pos;
     struct canbus_msg canhw_queue[32];
 } UsbCan = {
@@ -198,7 +199,14 @@ drain_canhw_queue(void)
             UsbCan.usb_send_busy = 1;
             return;
         }
-        UsbCan.canhw_pull_pos = pull_pos = pull_pos + 1;
+        /*
+         * The CAN receive interrupt may reuse this slot after pull_pos changes.
+         * Publish returned capacity only after send_frame() has finished every
+         * read from the entry; the accessor supplies the compiler barrier for
+         * that task-to-interrupt ownership transfer.
+         */
+        pull_pos++;
+        writel(&UsbCan.canhw_pull_pos, pull_pos);
     }
 }
 
@@ -461,7 +469,8 @@ canbus_process_data(struct canbus_msg *msg)
 {
     // Add to admin command queue
     uint32_t pushp = UsbCan.canhw_push_pos;
-    if (pushp - UsbCan.canhw_pull_pos >= ARRAY_SIZE(UsbCan.canhw_queue))
+    uint32_t pullp = readl(&UsbCan.canhw_pull_pos);
+    if (pushp - pullp >= ARRAY_SIZE(UsbCan.canhw_queue))
         // No space - drop message
         return;
     if (UsbCan.assigned_id && (msg->id & ~1) == UsbCan.assigned_id)
@@ -469,7 +478,15 @@ canbus_process_data(struct canbus_msg *msg)
         return;
     uint32_t pos = pushp % ARRAY_SIZE(UsbCan.canhw_queue);
     memcpy(&UsbCan.canhw_queue[pos], msg, sizeof(*msg));
-    UsbCan.canhw_push_pos = pushp + 1;
+    /*
+     * push_pos is the interrupt's publication record: once the task observes
+     * it, every byte in this slot must already be visible.  A barriered store
+     * records that ordering explicitly instead of relying on the following
+     * wake function to prevent compiler reordering.  This ring has one IRQ
+     * producer and one task consumer, so independent monotonic indexes retain
+     * lock-free operation and rollover-safe unsigned distance checks.
+     */
+    writel(&UsbCan.canhw_push_pos, pushp + 1);
     wake_usbcan_task();
 }
 
