@@ -249,12 +249,13 @@ update_receive_seq(struct serialqueue *sq, double eventtime, uint64_t rseq)
 
 // Process a well formed input message
 static void
-handle_message(struct serialqueue *sq, double eventtime, int len)
+handle_message(struct serialqueue *sq, double eventtime, double receive_time
+               , const uint8_t *msg, int len)
 {
     pthread_mutex_lock(&sq->lock);
 
     // Calculate receive sequence number
-    uint32_t rseq_delta = ((sq->input_buf[MESSAGE_POS_SEQ] - sq->receive_seq)
+    uint32_t rseq_delta = ((msg[MESSAGE_POS_SEQ] - sq->receive_seq)
                            & MESSAGE_SEQ_MASK);
     uint64_t rseq = sq->receive_seq + rseq_delta;
     if (rseq != sq->receive_seq) {
@@ -296,11 +297,10 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
             pollreactor_update_timer(sq->pr, SQPT_RETRANSMIT, PR_NOW);
     } else {
         // Data message - add to receive queue
-        struct queue_message *qm = message_fill(sq->input_buf, len);
+        struct queue_message *qm = message_fill(msg, len);
         qm->sent_time = (rseq > sq->retransmit_seq
                          ? sq->last_receive_sent_time : 0.);
-        qm->receive_time = get_monotonic(); // must be time post read()
-        qm->receive_time -= calculate_bittime(sq, len);
+        qm->receive_time = receive_time - calculate_bittime(sq, len);
         list_add_tail(&qm->node, &received);
     }
 
@@ -311,17 +311,52 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
     struct fastreader *fr;
     list_for_each_entry(fr, &sq->fast_readers, node) {
         if (len < fr->prefix_len + MESSAGE_MIN
-            || memcmp(&sq->input_buf[MESSAGE_HEADER_SIZE]
+            || memcmp(&msg[MESSAGE_HEADER_SIZE]
                       , fr->prefix, fr->prefix_len) != 0)
             continue;
         // Release main lock and invoke callback
         pthread_mutex_lock(&sq->fast_reader_dispatch_lock);
         pthread_mutex_unlock(&sq->lock);
-        fr->func(fr, eventtime, sq->input_buf, len);
+        fr->func(fr, eventtime, msg, len);
         pthread_mutex_unlock(&sq->fast_reader_dispatch_lock);
         return;
     }
     pthread_mutex_unlock(&sq->lock);
+}
+
+// Process complete frames and retain any incomplete trailing data
+static void
+process_input(struct serialqueue *sq, double eventtime)
+{
+    // Walk each complete frame in place and compact the buffer only once
+    int consumed = 0, invalid = 0;
+    double receive_time = 0.;
+    for (;;) {
+        const uint8_t *msg = &sq->input_buf[consumed];
+        int available = sq->input_pos - consumed;
+        int msg_len = msgblock_check(&sq->need_sync, msg, available);
+        if (!msg_len)
+            break;
+        if (msg_len > 0) {
+            // Timestamp after read(), once for all messages in this batch
+            if (msg_len > MESSAGE_MIN && !receive_time)
+                receive_time = get_monotonic();
+            handle_message(sq, eventtime, receive_time, msg, msg_len);
+        } else {
+            // Skip malformed data at the beginning of the input
+            msg_len = -msg_len;
+            invalid += msg_len;
+        }
+        consumed += msg_len;
+    }
+    if (invalid) {
+        pthread_mutex_lock(&sq->lock);
+        sq->bytes_invalid += invalid;
+        pthread_mutex_unlock(&sq->lock);
+    }
+    sq->input_pos -= consumed;
+    if (consumed && sq->input_pos)
+        memmove(sq->input_buf, &sq->input_buf[consumed], sq->input_pos);
 }
 
 // Callback for input activity on the serial fd
@@ -363,25 +398,7 @@ input_event(struct serialqueue *sq, double eventtime)
         }
         sq->input_pos += ret;
     }
-    for (;;) {
-        int len = msgblock_check(&sq->need_sync, sq->input_buf, sq->input_pos);
-        if (!len)
-            // Need more data
-            return;
-        if (len > 0) {
-            // Received a valid message
-            handle_message(sq, eventtime, len);
-        } else {
-            // Skip bad data at beginning of input
-            len = -len;
-            pthread_mutex_lock(&sq->lock);
-            sq->bytes_invalid += len;
-            pthread_mutex_unlock(&sq->lock);
-        }
-        sq->input_pos -= len;
-        if (sq->input_pos)
-            memmove(sq->input_buf, &sq->input_buf[len], sq->input_pos);
-    }
+    process_input(sq, eventtime);
 }
 
 // Callback for input activity on the pipe fd (wakes command_event)

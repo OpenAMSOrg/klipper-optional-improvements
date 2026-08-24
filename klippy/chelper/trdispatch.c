@@ -61,7 +61,7 @@ send_trsync_set_timeout(struct trdispatch_mcu *tdm)
 // Handle a trsync_state message (callback from serialqueue fastreader)
 static void
 handle_trsync_state(struct fastreader *fr, double eventtime
-                    , uint8_t *data, int len)
+                    , const uint8_t *data, int len)
 {
     struct trdispatch_mcu *tdm = container_of(fr, struct trdispatch_mcu, fr);
 

@@ -10,7 +10,7 @@
 
 struct fastreader;
 typedef void (*fastreader_cb)(struct fastreader *fr, double eventtime
-                              , uint8_t *data, int len);
+                              , const uint8_t *data, int len);
 
 struct fastreader {
     struct list_node node;
