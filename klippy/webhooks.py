@@ -38,7 +38,10 @@ else:
 
 # Bounds on resources controlled by API clients
 REQUEST_LOG_SIZE = 20
+MAX_REQUEST_SIZE = 1024 * 1024
+MAX_REQUEST_LOG_ENTRY = 16 * 1024
 MAX_CLIENT_CONNECTIONS = 64
+MAX_REQUESTS_PER_READ = 128
 
 class WebRequestError(gcode.CommandError):
     def __init__(self, message,):
@@ -222,14 +225,15 @@ class ClientConnection:
         logging.info("\n".join(out))
 
     def set_client_info(self, client_info, state_msg=None):
+        client_repr = repr(client_info)[:MAX_REQUEST_LOG_ENTRY]
         if state_msg is None:
-            state_msg = "Client info %s" % (repr(client_info),)
+            state_msg = "Client info %s" % (client_repr,)
         logging.info("webhooks client %s: %s", self.uid, state_msg)
         log_id = "webhooks %s" % (self.uid,)
         if client_info is None:
             self.printer.set_rollover_info(log_id, None, log=False)
             return
-        rollover_msg = "webhooks client %s: %s" % (self.uid, repr(client_info))
+        rollover_msg = "webhooks client %s: %s" % (self.uid, client_repr)
         self.printer.set_rollover_info(log_id, rollover_msg, log=False)
 
     def close(self):
@@ -264,14 +268,33 @@ class ClientConnection:
         requests = data.split(b'\x03')
         requests[0] = self.partial_data + requests[0]
         self.partial_data = requests.pop()
+        if len(requests) > MAX_REQUESTS_PER_READ:
+            logging.warning("webhooks: Closing client %s with excessive "
+                            "request rate", self.uid)
+            self.close()
+            return
+        if self.partial_data and len(self.partial_data) > MAX_REQUEST_SIZE:
+            logging.warning("webhooks: Closing client %s with overlong request",
+                            self.uid)
+            self.close()
+            return
         for req in requests:
-            self.request_log.append((eventtime, req))
+            if not req:
+                continue
+            if len(req) > MAX_REQUEST_SIZE:
+                logging.warning(
+                    "webhooks: Closing client %s with overlong request",
+                    self.uid)
+                self.close()
+                return
+            self.request_log.append((eventtime, req[:MAX_REQUEST_LOG_ENTRY]))
             try:
                 web_request = WebRequest(self, req)
             except Exception:
-                logging.exception("webhooks: Error decoding Server Request %s"
-                                  % (req))
-                continue
+                logging.exception("webhooks: Error decoding Server Request "
+                                  "%s", req[:MAX_REQUEST_LOG_ENTRY])
+                self.close()
+                return
             self.reactor.register_callback(
                 lambda e, s=self, wr=web_request: s._process_request(wr))
 
