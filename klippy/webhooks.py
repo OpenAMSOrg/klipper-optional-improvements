@@ -43,6 +43,9 @@ MAX_REQUEST_LOG_ENTRY = 16 * 1024
 MAX_SEND_BUFFER_SIZE = 8 * 1024 * 1024
 MAX_CLIENT_CONNECTIONS = 64
 MAX_REQUESTS_PER_READ = 128
+MAX_REMOTE_METHOD_LENGTH = 256
+MAX_REMOTE_TEMPLATE_SIZE = 64 * 1024
+MAX_REMOTE_METHODS_PER_CLIENT = 64
 
 class WebRequestError(gcode.CommandError):
     def __init__(self, message,):
@@ -247,6 +250,7 @@ class ClientConnection:
             self.sock.close()
         except socket.error:
             pass
+        self.webhooks.remove_client(self)
         self.server.pop_client(self.uid)
 
     def is_closed(self):
@@ -430,9 +434,22 @@ class WebHooks:
         template = web_request.get_dict('response_template')
         method = web_request.get_str('remote_method')
         new_conn = web_request.get_client_connection()
+        registered_count = sum(
+            new_conn in conn_map for conn_map in self._remote_methods.values())
+        if (not method or len(method) > MAX_REMOTE_METHOD_LENGTH
+            or len(json_dumps(template)) > MAX_REMOTE_TEMPLATE_SIZE
+            or (new_conn not in self._remote_methods.get(method, {})
+                and registered_count >= MAX_REMOTE_METHODS_PER_CLIENT)):
+            raise WebRequestError("Invalid remote method registration")
         logging.info("webhooks: registering remote method '%s' "
                      "for connection id: %d" % (method, id(new_conn)))
         self._remote_methods.setdefault(method, {})[new_conn] = template
+
+    def remove_client(self, connection):
+        for method, conn_map in list(self._remote_methods.items()):
+            conn_map.pop(connection, None)
+            if not conn_map:
+                del self._remote_methods[method]
 
     def get_connection(self):
         return self.sconn
@@ -458,14 +475,15 @@ class WebHooks:
                 "Remote method '%s' not registered" % (method))
         conn_map = self._remote_methods[method]
         valid_conns = {}
-        for conn, template in conn_map.items():
+        for conn, template in list(conn_map.items()):
             if not conn.is_closed():
-                valid_conns[conn] = template
                 out = {'params': kwargs}
                 out.update(template)
                 conn.send(out)
+                if not conn.is_closed():
+                    valid_conns[conn] = template
         if not valid_conns:
-            del self._remote_methods[method]
+            self._remote_methods.pop(method, None)
             raise self.printer.command_error(
                 "No active connections for method '%s'" % (method))
         self._remote_methods[method] = valid_conns
