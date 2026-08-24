@@ -270,6 +270,19 @@ CAN_IRQHandler(void)
             >= CAN_ERROR_WARNING_LIMIT)
             CAN_Errors.tx_error += 1;
     }
+
+    /*
+     * LPC CAN hardware sets both Bus Status and Reset Mode when the transmit
+     * error counter reaches bus-off.  Reset Mode disconnects the controller
+     * from the bus and remains set until the CPU explicitly clears it, so only
+     * recording the error leaves the node permanently silent after a transient
+     * wiring fault.  Clear the hardware-entered reset state to begin recovery.
+     * The controller still observes the protocol-required 128 bus-free
+     * sequences before becoming bus-on; this does not force the error counters
+     * clear or permit an early return to active traffic.
+     */
+    if ((LPC_CANx->GSR & CAN_GSR_BS) && (LPC_CANx->MOD & CAN_MOD_RM))
+        LPC_CANx->MOD &= ~CAN_MOD_RM;
 }
 
 void
