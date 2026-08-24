@@ -5,6 +5,9 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, re, logging, collections, shlex, operator, math
 
+# Prevent unbounded buffering of an unterminated input command
+MAX_COMMAND_LENGTH = 1024 * 1024
+
 def parse_float(value):
     # Non-finite values bypass normal minval and maxval comparisons
     value = float(value)
@@ -106,6 +109,7 @@ class GCodeCommand:
 class GCodeDispatch:
     error = CommandError
     Coord = Coord
+    MAX_COMMAND_LENGTH = MAX_COMMAND_LENGTH
     def __init__(self, printer):
         self.printer = printer
         self.is_fileinput = not not printer.get_start_args().get("debuginput")
@@ -208,6 +212,13 @@ class GCodeDispatch:
     args_r = re.compile('([A-Z_]+|[A-Z*])')
     def _process_commands(self, commands, need_ack=True):
         for line in commands:
+            if len(line) > MAX_COMMAND_LENGTH:
+                msg = "G-Code command exceeds maximum length"
+                self._respond_error(msg)
+                self.printer.send_event("gcode:command_error")
+                if not need_ack:
+                    raise self.error(msg)
+                continue
             # Ignore comments and leading/trailing spaces
             line = origline = line.strip()
             cpos = line.find(';')
@@ -411,6 +422,7 @@ class GCodeIO:
             self.fd_handle = self.reactor.register_fd(self.fd,
                                                       self._process_data)
         self.partial_input = ""
+        self.is_discarding_line = False
         self.pending_commands = []
         self.bytes_read = 0
         self.input_log = collections.deque([], 50)
@@ -451,8 +463,27 @@ class GCodeIO:
         self.input_log.append((eventtime, data))
         self.bytes_read += len(data)
         lines = data.split('\n')
-        lines[0] = self.partial_input + lines[0]
-        self.partial_input = lines.pop()
+        if self.is_discarding_line:
+            if len(lines) == 1:
+                lines = []
+            else:
+                self.is_discarding_line = False
+                lines = lines[1:]
+        else:
+            lines[0] = self.partial_input + lines[0]
+        if lines:
+            self.partial_input = lines.pop()
+        else:
+            self.partial_input = ""
+        if len(self.partial_input) > MAX_COMMAND_LENGTH:
+            logging.warning("Discarding overlong G-Code command")
+            self.partial_input = ""
+            self.is_discarding_line = True
+        valid_lines = [line for line in lines
+                       if len(line) <= MAX_COMMAND_LENGTH]
+        if len(valid_lines) != len(lines):
+            logging.warning("Discarding overlong G-Code command")
+        lines = valid_lines
         pending_commands = self.pending_commands
         pending_commands.extend(lines)
         self.pipe_is_active = True

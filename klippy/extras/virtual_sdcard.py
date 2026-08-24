@@ -269,6 +269,15 @@ class VirtualSD:
                 lines = data.split('\n')
                 lines[0] = partial_input + lines[0]
                 partial_input = lines.pop()
+                if (len(partial_input) > self.gcode.MAX_COMMAND_LENGTH
+                    or any(len(line) > self.gcode.MAX_COMMAND_LENGTH
+                           for line in lines)):
+                    error_message = "G-Code command exceeds maximum length"
+                    try:
+                        self.gcode.run_script(self.on_error_gcode.render())
+                    except:
+                        logging.exception("virtual_sdcard on_error")
+                    break
                 lines.reverse()
                 self.reactor.pause(self.reactor.NOW)
                 continue
