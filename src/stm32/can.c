@@ -230,7 +230,25 @@ CAN_IRQHandler(void)
         SOC_CAN->RF0R = CAN_RF0R_FOVR0;
         CAN_Errors.rx_overflows++;
     }
-    if (rf0r & CAN_RF0R_FMP0) {
+    /*
+     * FMP0 is the number of complete frames already resident in the three-slot
+     * FIFO, not merely a boolean pending flag.  Processing one entry and
+     * returning leaves the interrupt asserted for the next entry, forcing the
+     * Cortex-M to repeat exception return and entry plus every unrelated status
+     * check below.  Snapshot the count and process that arrival batch in one
+     * invocation so the fixed interrupt cost is paid once for up to three CAN
+     * frames.
+     *
+     * Use the entry snapshot instead of polling FMP0 until empty.  A
+     * continuously busy bus can refill a slot after RFOM0 returns it; chasing
+     * that live level would make interrupt residency traffic-dependent and
+     * could postpone higher-level scheduler work indefinitely.  Any frame
+     * arriving after the snapshot leaves FMP0 asserted and causes the normal
+     * next interrupt, while this invocation remains strictly bounded by the
+     * hardware FIFO depth.
+     */
+    uint32_t pending = rf0r & CAN_RF0R_FMP0;
+    while (pending--) {
         // Read and ack data packet
         CAN_FIFOMailBox_TypeDef *mb = &SOC_CAN->sFIFOMailBox[0];
         uint32_t rir = mb->RIR;
