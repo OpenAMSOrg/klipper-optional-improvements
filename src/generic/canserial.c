@@ -26,7 +26,7 @@ static struct canbus_data {
 
     // Tx data
     struct task_wake tx_wake;
-    uint8_t transmit_pos, transmit_max;
+    uint8_t transmit_pos, transmit_max, admin_tx_pending;
 
     // Rx data
     struct task_wake rx_wake;
@@ -38,6 +38,8 @@ static struct canbus_data {
     uint8_t transmit_buf[192];
     uint8_t receive_buf[192];
 } CanData;
+
+static int can_send_query_response(void);
 
 
 /****************************************************************
@@ -56,6 +58,22 @@ canserial_tx_task(void)
     if (!sched_check_wake(&CanData.tx_wake))
         return;
     uint32_t id = CanData.assigned_id;
+    /*
+     * canbus_send() returning a negative value means that no frame was accepted
+     * and the controller will call canserial_notify_tx() when a transmit slot
+     * becomes available.  Busy-waiting here is therefore both unnecessary and
+     * dangerous: this is a cooperative scheduler task, so a full controller on
+     * a disconnected bus could otherwise prevent every other task, including
+     * shutdown processing, from running.  Retain one pending admin response and
+     * return to the scheduler.  Repeated queries coalesce into that response,
+     * and assigning the node makes the response obsolete instead of sending a
+     * stale unassigned-node announcement.
+     */
+    if (CanData.admin_tx_pending) {
+        if (!id && can_send_query_response() < 0)
+            return;
+        CanData.admin_tx_pending = 0;
+    }
     if (!id) {
         CanData.transmit_pos = CanData.transmit_max = 0;
         return;
@@ -142,23 +160,26 @@ can_decode_nodeid(int nodeid)
     return (nodeid << 1) + 0x100;
 }
 
-static void
-can_process_query_unassigned(struct canbus_msg *msg)
+static int
+can_send_query_response(void)
 {
-    if (CanData.assigned_id)
-        return;
     struct canbus_msg send;
     send.id = CANBUS_ID_ADMIN_RESP;
     send.dlc = 8;
     send.data[0] = CANBUS_RESP_NEED_NODEID;
     memcpy(&send.data[1], CanData.uuid, sizeof(CanData.uuid));
     send.data[7] = CANBUS_CMD_SET_KLIPPER_NODEID;
-    // Send with retry
-    for (;;) {
-        int ret = canbus_send(&send);
-        if (ret >= 0)
-            return;
-    }
+    return canbus_send(&send);
+}
+
+static void
+can_process_query_unassigned(struct canbus_msg *msg)
+{
+    if (CanData.assigned_id)
+        return;
+    // Retry from the transmit task if the controller queue is full
+    CanData.admin_tx_pending = 1;
+    canserial_notify_tx();
 }
 
 static void
