@@ -30,6 +30,7 @@ class ManualStepper:
         self.motion_queuing = self.printer.load_object(config, 'motion_queuing')
         self.trapq = self.motion_queuing.allocate_trapq()
         self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        self.trapq_append_moves = self.motion_queuing.append_trapq_moves
         self.rail.setup_itersolve('cartesian_stepper_alloc', b'x')
         self.rail.set_trapq(self.trapq)
         # Registered with toolhead as an axtra axis
@@ -166,17 +167,30 @@ class ManualStepper:
         self.gaxis_limit_accel = limit_accel
         toolhead.add_extra_axis(self, self.commanded_pos)
     def process_move(self, print_time, move, ea_index):
-        axis_r = move.axes_r[ea_index]
-        start_pos = move.start_pos[ea_index]
-        accel = move.accel * axis_r
-        start_v = move.start_v * axis_r
-        cruise_v = move.cruise_v * axis_r
-        self.trapq_append(self.trapq, print_time,
-                          move.accel_t, move.cruise_t, move.decel_t,
-                          start_pos, 0., 0.,
-                          1., 0., 0.,
-                          start_v, cruise_v, accel)
-        self.commanded_pos = move.end_pos[ea_index]
+        # Retain the established single-move entry point for callers outside
+        # ToolHead; the normal lookahead path discovers process_moves() and
+        # submits a bounded group instead.
+        self.process_moves(((print_time, move, ea_index),))
+    def process_moves(self, moves):
+        if not moves:
+            return
+        trapq_moves = []
+        last_move = last_ea_index = None
+        for print_time, move, ea_index in moves:
+            axis_r = move.axes_r[ea_index]
+            start_pos = move.start_pos[ea_index]
+            accel = move.accel * axis_r
+            start_v = move.start_v * axis_r
+            cruise_v = move.cruise_v * axis_r
+            trapq_moves.append((
+                print_time,
+                move.accel_t, move.cruise_t, move.decel_t,
+                start_pos, 0., 0.,
+                1., 0., 0.,
+                start_v, cruise_v, accel))
+            last_move, last_ea_index = move, ea_index
+        self.trapq_append_moves(self.trapq, trapq_moves)
+        self.commanded_pos = last_move.end_pos[last_ea_index]
     def check_move(self, move, ea_index):
         # Check move is in bounds
         movepos = move.end_pos[ea_index]

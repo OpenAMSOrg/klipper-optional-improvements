@@ -295,6 +295,17 @@ class ToolHead:
             self.print_time = min_print_time
             self.printer.send_event("toolhead:sync_print_time",
                                     curtime, est_print_time, self.print_time)
+    def _flush_trapq_batches(self, trapq_moves, extra_axis_batches):
+        # Submit every queue through the current move before a timing callback
+        # can inspect motion state.  Each native helper consumes its temporary
+        # array synchronously, so the Python lists may be emptied and reused
+        # without retaining foreign-owned storage between batches.
+        self.trapq_append_moves(self.trapq, trapq_moves)
+        del trapq_moves[:]
+        for _, process_moves, axis_moves in extra_axis_batches:
+            if axis_moves:
+                process_moves(axis_moves)
+                del axis_moves[:]
     def _process_lookahead(self, lazy=False):
         moves = self.lookahead.flush(lazy=lazy)
         if not moves:
@@ -308,12 +319,21 @@ class ToolHead:
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
         trapq_moves = []
-        # Primary and extra-axis trapqs remain private until step generation
-        # begins after this loop.  It is therefore safe for an extra axis to
-        # append its record while primary records are still in this host batch;
-        # no consumer can observe their temporary insertion order.  Timing
-        # callbacks are the one Python-visible boundary and explicitly flush
-        # the batch below before they run.
+        extra_axis_batches = []
+        for ea in self.extra_axes:
+            process_moves = getattr(ea, 'process_moves', None)
+            axis_moves = None
+            if process_moves is not None:
+                axis_moves = []
+            extra_axis_batches.append((ea, process_moves, axis_moves))
+        batch_move_count = 0
+        # Primary and batch-capable extra-axis trapqs remain private until step
+        # generation begins after this loop.  A third-party extra axis that has
+        # only the established process_move() method retains immediate per-move
+        # submission; process_moves() is an optional optimization and not a new
+        # requirement for existing axis implementations.  Timing callbacks are
+        # the Python-visible boundary, so all native queues and axis position
+        # side effects are explicitly brought current before a callback runs.
         with self.reactor.assert_no_pause():
             for move in moves:
                 if move.is_kinematic_move:
@@ -329,21 +349,30 @@ class ToolHead:
                         move.start_pos[0], move.start_pos[1], move.start_pos[2],
                         move.axes_r[0], move.axes_r[1], move.axes_r[2],
                         move.start_v, move.cruise_v, move.accel))
-                for e_index, ea in enumerate(self.extra_axes):
+                for e_index, axis_batch in enumerate(extra_axis_batches):
+                    ea, process_moves, axis_moves = axis_batch
                     if move.axes_d[e_index + 3]:
-                        ea.process_move(next_move_time, move, e_index + 3)
+                        if process_moves is None:
+                            ea.process_move(next_move_time, move, e_index + 3)
+                        else:
+                            axis_moves.append((next_move_time, move,
+                                               e_index + 3))
                 next_move_time = (next_move_time + move.accel_t
                                   + move.cruise_t + move.decel_t)
-                # A timing callback may inspect motion state.  Flush every
-                # primary-axis record through this move before invoking it,
-                # preserving the former append-before-callback guarantee.
-                if (len(trapq_moves) >= TRAPQ_BATCH_SIZE
+                batch_move_count += 1
+                # Bound every per-axis list by counting source moves instead of
+                # primary records.  Extrude-only moves do not enter the primary
+                # trapq, and must not allow an extra-axis batch to grow without
+                # limit.  Flush all queues together so timing callbacks retain
+                # the former append-before-callback guarantee.
+                if (batch_move_count >= TRAPQ_BATCH_SIZE
                     or move.timing_callbacks):
-                    self.trapq_append_moves(self.trapq, trapq_moves)
-                    trapq_moves = []
+                    self._flush_trapq_batches(trapq_moves,
+                                              extra_axis_batches)
+                    batch_move_count = 0
                 for cb in move.timing_callbacks:
                     cb(next_move_time)
-            self.trapq_append_moves(self.trapq, trapq_moves)
+            self._flush_trapq_batches(trapq_moves, extra_axis_batches)
         # Generate steps for moves
         self._advance_move_time(next_move_time)
         self.motion_queuing.note_mcu_movequeue_activity(next_move_time)
