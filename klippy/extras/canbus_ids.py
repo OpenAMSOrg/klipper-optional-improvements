@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 NODEID_FIRST = 4
+NODEID_LAST = 0xff
 
 class PrinterCANBus:
     def __init__(self, config):
@@ -37,6 +38,16 @@ class PrinterCANBus:
         if key in self.ids:
             raise config.error("Duplicate canbus_uuid")
         new_id = self.next_nodeids.get(canbus_iface, NODEID_FIRST)
+        # CMD_SET_KLIPPER_NODEID has one byte for this value, and both command
+        # and response arbitration identifiers are derived from that same byte.
+        # Letting Python's unbounded integer advance past 0xff does not create
+        # more protocol address space; it fails later while python-can encodes
+        # the assignment payload, after configuration has otherwise succeeded.
+        # Reject exhaustion here so the error names the affected interface and
+        # no partially connected set of MCUs is left behind.
+        if new_id > NODEID_LAST:
+            raise config.error("Too many CAN bus MCUs on interface '%s'"
+                               % (canbus_iface,))
         self.ids[key] = new_id
         self.next_nodeids[canbus_iface] = new_id + 1
         return new_id
