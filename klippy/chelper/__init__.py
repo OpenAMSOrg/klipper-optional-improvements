@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging
+import os, logging, shlex, subprocess
 import cffi
 
 
@@ -265,14 +265,17 @@ def check_build_code(sources, target):
 
 # Check if the current gcc version supports a particular command-line option
 def check_gcc_option(option):
-    cmd = "%s %s -S -o /dev/null -xc /dev/null > /dev/null 2>&1" % (
-        GCC_CMD, option)
-    res = os.system(cmd)
+    cmd = [GCC_CMD] + shlex.split(option) + [
+        '-S', '-o', os.devnull, '-xc', os.devnull]
+    with open(os.devnull, 'wb') as devnull:
+        res = subprocess.call(cmd, stdout=devnull, stderr=devnull)
     return res == 0
 
-# Check if the current gcc version supports a particular command-line option
+# Run a compiler command without invoking a shell
 def do_build_code(cmd):
-    res = os.system(cmd)
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+    res = subprocess.call(cmd)
     if res:
         msg = "Unable to build C code module (error=%s)" % (res,)
         logging.error(msg)
@@ -287,15 +290,13 @@ def check_build_c_library():
     if not check_build_code(srcfiles+ofiles+[__file__], destlib):
         # Code already built
         return destlib
-    # Select command line options
-    if check_gcc_option(SSE_FLAGS):
-        cmd = "%s %s %s" % (GCC_CMD, SSE_FLAGS, COMPILE_ARGS)
-    else:
-        cmd = "%s %s" % (GCC_CMD, COMPILE_ARGS)
     # Invoke compiler
     logging.info("Building C code module %s", DEST_LIB)
     tempdestlib = get_abs_files(srcdir, ["_temp_" + DEST_LIB])[0]
-    do_build_code(cmd % (tempdestlib, ' '.join(srcfiles)))
+    compile_flags = shlex.split(COMPILE_ARGS % (tempdestlib, ''))
+    if check_gcc_option(SSE_FLAGS):
+        compile_flags = shlex.split(SSE_FLAGS) + compile_flags
+    do_build_code([GCC_CMD] + compile_flags + srcfiles)
     # Rename from temporary file to final file name
     os.rename(tempdestlib, destlib)
     return destlib
@@ -330,11 +331,9 @@ def get_ffi():
 # hub-ctrl hub power controller
 ######################################################################
 
-HC_COMPILE_CMD = "gcc -Wall -g -O2 -o %s %s -lusb"
 HC_SOURCE_FILES = ['hub-ctrl.c']
 HC_SOURCE_DIR = '../../lib/hub-ctrl'
 HC_TARGET = "hub-ctrl"
-HC_CMD = "sudo %s/hub-ctrl -h 0 -P 2 -p %d"
 
 def run_hub_ctrl(enable_power):
     srcdir = os.path.dirname(os.path.realpath(__file__))
@@ -343,8 +342,10 @@ def run_hub_ctrl(enable_power):
     destlib = get_abs_files(hubdir, [HC_TARGET])[0]
     if check_build_code(srcfiles, destlib):
         logging.info("Building C code module %s", HC_TARGET)
-        do_build_code(HC_COMPILE_CMD % (destlib, ' '.join(srcfiles)))
-    os.system(HC_CMD % (hubdir, enable_power))
+        do_build_code([GCC_CMD, '-Wall', '-g', '-O2', '-o', destlib]
+                      + srcfiles + ['-lusb'])
+    subprocess.call(['sudo', destlib, '-h', '0', '-P', '2',
+                     '-p', str(enable_power)])
 
 
 if __name__ == '__main__':
