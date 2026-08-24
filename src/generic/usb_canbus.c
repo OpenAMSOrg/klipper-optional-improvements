@@ -99,6 +99,7 @@ struct gs_host_frame {
 
 #define GS_CAN_SFF_MASK 0x000007ff
 #define GS_CAN_EFF_MASK 0x1fffffff
+#define GS_HOST_FRAME_ECHO_ID_RX 0xffffffff
 
 static int
 gs_can_id_is_valid(uint32_t id)
@@ -153,7 +154,7 @@ static int
 send_frame(struct canbus_msg *msg)
 {
     struct gs_host_frame gs = {};
-    gs.echo_id = 0xffffffff;
+    gs.echo_id = GS_HOST_FRAME_ECHO_ID_RX;
     gs.can_id = msg->id;
     gs.can_dlc = msg->dlc;
     /*
@@ -262,6 +263,17 @@ drain_usb_host_messages(void)
          * USB echo, and the physical bus all refer to the same CAN frame.
          */
         if (!gs_can_id_is_valid(gs->can_id))
+            continue;
+        /*
+         * GS_HOST_FRAME_ECHO_ID_RX distinguishes a device-originated receive
+         * frame from the echo which completes a host transmit request.  If the
+         * host is allowed to supply that reserved value, reflecting the frame
+         * makes Linux inject its own transmission as bus input and skip the
+         * transmit-context completion.  Besides reporting false receive data,
+         * enough missing completions stop the SocketCAN transmit queue.  Only
+         * the device-to-host path may create the receive marker.
+         */
+        if (gs->echo_id == GS_HOST_FRAME_ECHO_ID_RX)
             continue;
         UsbCan.host_push_pos = push_pos = push_pos + 1;
     }
