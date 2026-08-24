@@ -49,6 +49,7 @@ msgblock_finalize(uint8_t *buf, uint8_t msg_len, uint8_t sequence)
 int
 msgblock_check(uint8_t *need_sync, const uint8_t *buf, int buf_len)
 {
+    const uint8_t *next_sync;
     if (buf_len < MESSAGE_MIN)
         // Need more data
         return 0;
@@ -74,7 +75,7 @@ msgblock_check(uint8_t *need_sync, const uint8_t *buf, int buf_len)
 
 resync:
     // Discard through the next sync byte before testing another frame
-    const uint8_t *next_sync = memchr(buf, MESSAGE_SYNC, buf_len);
+    next_sync = memchr(buf, MESSAGE_SYNC, buf_len);
     if (next_sync) {
         *need_sync = 0;
         return -(next_sync - buf + 1);
