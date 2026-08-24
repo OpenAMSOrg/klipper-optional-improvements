@@ -242,6 +242,20 @@ CAN_IRQHandler(void)
         CANx->MCAN_IR = FDCAN_IE_TC;
         canbus_notify_tx();
     }
+    if (ir & MCAN_IR_BO) {
+        /*
+         * The M_CAN core enters software-initialization mode by setting INIT
+         * when its transmit error counter reaches bus-off.  In that mode it is
+         * completely disconnected from the bus and will remain so even after
+         * the wiring fault disappears; there is no automatic bus-off-management
+         * option.  Clear INIT after acknowledging the event to start the ISO
+         * CAN recovery sequence.  The controller still waits for the required
+         * 129 occurrences of 11 recessive bits, so this does not bypass or
+         * shorten the protocol's recovery safety interval.
+         */
+        CANx->MCAN_IR = MCAN_IR_BO;
+        CANx->MCAN_CCCR &= ~MCAN_CCCR_INIT;
+    }
     if (ir & (MCAN_IR_PED | MCAN_IR_PEA)) {
         // Bus error
         uint32_t psr = CANx->MCAN_PSR;
@@ -373,6 +387,7 @@ can_init(void)
     /*##-3- Configure Interrupts #################################*/
     armcm_enable_irq(CAN_IRQHandler, CANx_IRQn, 1);
     CANx->MCAN_ILE = MCAN_ILE_EINT0;
-    CANx->MCAN_IE = MCAN_IE_RF0NE | FDCAN_IE_TC | MCAN_IE_PEDE | MCAN_IE_PEAE;
+    CANx->MCAN_IE = (MCAN_IE_RF0NE | FDCAN_IE_TC | MCAN_IE_BOE
+                     | MCAN_IE_PEDE | MCAN_IE_PEAE);
 }
 DECL_INIT(can_init);
