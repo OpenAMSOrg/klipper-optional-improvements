@@ -33,7 +33,10 @@ thought of as a "broadcast address".
 
 This command queries all micro-controllers that have not yet been
 assigned a `canbus_nodeid`. Unassigned micro-controllers will respond
-with a RESP_NEED_NODEID response message.
+with a RESP_NEED_NODEID response message. Klipper micro-controllers
+delay that response by an interval derived from their `canbus_uuid` so
+that multiple unassigned nodes do not normally transmit the response
+with the same CAN bus id at the same time.
 
 The CMD_QUERY_UNASSIGNED message format is:
 `<1-byte message_id = 0x00>`

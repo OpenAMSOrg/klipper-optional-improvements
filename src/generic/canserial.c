@@ -19,6 +19,28 @@
 
 #define CANBUS_UUID_LEN 6
 
+enum {
+    CQS_IDLE, CQS_WAITING, CQS_READY
+};
+
+/*
+ * Unassigned nodes all transmit their discovery response with the same CAN
+ * identifier.  Arbitration therefore can not select one response by UUID:
+ * nodes whose payload bits differ instead detect an error during the data
+ * field and retry together.  Sending directly from the query handler would
+ * turn a normal broadcast into a synchronized collision storm on a bus with
+ * several unassigned devices.
+ *
+ * Keep explicit ownership of the one coalesced response while its randomized
+ * delay crosses scheduler contexts.  CQS_WAITING means the timer owns it and
+ * suppresses repeated queries, CQS_READY means the normal transmit task owns
+ * it (including controller-full retries), and CQS_IDLE means no discovery
+ * response is pending.  The timer only transfers ownership and wakes the
+ * transmit task; it must not bypass the CAN driver's task/wakeup contract by
+ * attempting I/O from the timer callback.
+ */
+static uint_fast8_t can_query_event(struct timer *timer);
+
 // Global storage
 static struct canbus_data {
     uint32_t assigned_id;
@@ -26,7 +48,8 @@ static struct canbus_data {
 
     // Tx data
     struct task_wake tx_wake;
-    uint8_t transmit_pos, transmit_max, admin_tx_pending;
+    struct timer query_timer;
+    uint8_t transmit_pos, transmit_max, query_state;
 
     // Rx data
     struct task_wake rx_wake;
@@ -37,7 +60,9 @@ static struct canbus_data {
     struct canbus_msg admin_queue[8];
     uint8_t transmit_buf[192];
     uint8_t receive_buf[192];
-} CanData;
+} CanData = {
+    .query_timer.func = can_query_event,
+};
 
 static int can_send_query_response(void);
 
@@ -50,6 +75,14 @@ void
 canserial_notify_tx(void)
 {
     sched_wake_task(&CanData.tx_wake);
+}
+
+static uint_fast8_t
+can_query_event(struct timer *timer)
+{
+    CanData.query_state = CQS_READY;
+    canserial_notify_tx();
+    return SF_DONE;
 }
 
 void
@@ -69,10 +102,10 @@ canserial_tx_task(void)
      * and assigning the node makes the response obsolete instead of sending a
      * stale unassigned-node announcement.
      */
-    if (CanData.admin_tx_pending) {
+    if (CanData.query_state == CQS_READY) {
         if (!id && can_send_query_response() < 0)
             return;
-        CanData.admin_tx_pending = 0;
+        CanData.query_state = CQS_IDLE;
     }
     if (!id) {
         CanData.transmit_pos = CanData.transmit_max = 0;
@@ -175,11 +208,14 @@ can_send_query_response(void)
 static void
 can_process_query_unassigned(struct canbus_msg *msg)
 {
-    if (CanData.assigned_id)
+    if (CanData.assigned_id || CanData.query_state != CQS_IDLE)
         return;
-    // Retry from the transmit task if the controller queue is full
-    CanData.admin_tx_pending = 1;
-    canserial_notify_tx();
+    // Spread responses over 1.5 seconds to avoid same-id collisions
+    uint32_t slot = CanData.uuid[0] | CanData.uuid[1] << 8;
+    CanData.query_state = CQS_WAITING;
+    CanData.query_timer.waketime = (timer_read_time()
+                                    + timer_from_us(100 + slot * 23));
+    sched_add_timer(&CanData.query_timer);
 }
 
 static void
@@ -379,6 +415,14 @@ canserial_set_uuid(uint8_t *raw_uuid, uint32_t raw_uuid_len)
 void
 canserial_shutdown(void)
 {
+    /*
+     * Shutdown removes scheduler timers before running shutdown callbacks, so
+     * a CQS_WAITING response can no longer become ready.  Reset the logical
+     * ownership as well as relying on timer removal: shutdown still wakes the
+     * transmit task, and leaving READY set could emit a stale discovery frame
+     * while the MCU is reporting its shutdown state.
+     */
+    CanData.query_state = CQS_IDLE;
     canserial_notify_tx();
     canserial_notify_rx();
 }
