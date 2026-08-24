@@ -12,8 +12,8 @@
 // clock times, prioritizes commands, and handles retransmissions.  A
 // background thread is launched to do this work and minimize latency.
 
-#define _GNU_SOURCE // recvmmsg
-#include <linux/can.h> // // struct can_frame
+#define _GNU_SOURCE // recvmmsg, sendmmsg
+#include <linux/can.h> // struct can_frame
 #include <math.h> // fabs
 #include <pthread.h> // pthread_mutex_lock
 #include <stddef.h> // offsetof
@@ -21,7 +21,7 @@
 #include <stdio.h> // snprintf
 #include <stdlib.h> // malloc
 #include <string.h> // memset
-#include <sys/socket.h> // recvmmsg
+#include <sys/socket.h> // recvmmsg, sendmmsg
 #include <termios.h> // tcflush
 #include <time.h> // clock_gettime
 #include <unistd.h> // pipe
@@ -119,6 +119,7 @@ struct serialqueue {
 #define DEBUG_QUEUE_RECEIVE 100
 
 #define CAN_RX_BATCH 16
+#define CAN_TX_BATCH 16
 
 // Create a series of empty messages and add them to a list
 static void
@@ -510,30 +511,64 @@ do_write(struct serialqueue *sq, void *buf, int buflen)
             report_errno("write", ret);
         return;
     }
-    // Write to CAN fd
-    struct can_frame cf;
-    // Clear kernel-visible padding fields
-    memset(&cf, 0, sizeof(cf));
-    cf.can_id = sq->client_id;
+    /*
+     * SocketCAN preserves one struct can_frame as one CAN packet.  Prepare a
+     * bounded vector of those records so a run of stream fragments crosses
+     * into the kernel once instead of issuing one write() for every eight
+     * bytes.  Sixteen frames cover 128 stream bytes and keep both stack use
+     * and the interval covered by a single system call bounded; command
+     * scheduling gets another opportunity between larger batches.
+     *
+     * Each iovec points at its own frame.  Reusing one frame for the complete
+     * vector would leave every entry referring to the final payload by the
+     * time sendmmsg() inspects it.  Zero the complete frame array as the
+     * kernel-visible padding bytes are outside can_dlc but are still part of
+     * every fixed-size SocketCAN record.
+     */
+    struct can_frame frames[CAN_TX_BATCH];
+    struct iovec iov[CAN_TX_BATCH];
+    struct mmsghdr msgs[CAN_TX_BATCH];
     uint8_t *data = buf;
     while (buflen) {
-        int size = buflen > 8 ? 8 : buflen;
-        cf.can_dlc = size;
-        memcpy(cf.data, data, size);
-        int ret = write(sq->serial_fd, &cf, sizeof(cf));
+        memset(frames, 0, sizeof(frames));
+        memset(msgs, 0, sizeof(msgs));
+        int frame_count = DIV_ROUND_UP(buflen, CAN_MAX_DLEN);
+        if (frame_count > CAN_TX_BATCH)
+            frame_count = CAN_TX_BATCH;
+        int pos = 0, i;
+        for (i=0; i<frame_count; i++) {
+            struct can_frame *cf = &frames[i];
+            int size = buflen - pos;
+            if (size > CAN_MAX_DLEN)
+                size = CAN_MAX_DLEN;
+            cf->can_id = sq->client_id;
+            cf->can_dlc = size;
+            memcpy(cf->data, &data[pos], size);
+            iov[i].iov_base = cf;
+            iov[i].iov_len = sizeof(*cf);
+            msgs[i].msg_hdr.msg_iov = &iov[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            pos += size;
+        }
+
+        int ret = sendmmsg(sq->serial_fd, msgs, frame_count, 0);
         /*
-         * A SocketCAN raw socket is record-oriented: success is exactly one
-         * complete struct can_frame, not a byte count that may be resumed with
-         * another write.  Advancing after a short positive result would drop
-         * the unsent suffix of this Klipper stream fragment, while writing that
-         * suffix separately would create a second and semantically different
-         * CAN frame.  The protocol retransmit machinery can recover after the
-         * connection is stopped, but it can not infer this silent boundary
-         * loss, so treat any short result as a fatal transport invariant
-         * violation.  Negative results retain the existing timed retry path.
+         * A positive return is the number of complete records accepted, not a
+         * byte count.  Linux may accept only a prefix if the socket becomes
+         * full part way through the vector.  Advance by exactly that prefix
+         * and present the remaining records again; treating the return as
+         * success for the complete vector would silently remove the suffix
+         * from Klipper's byte stream.  The follow-up call also recovers the
+         * otherwise hidden errno for the first unaccepted record.
+         *
+         * Successful SocketCAN records must each contain one complete struct
+         * can_frame.  A shorter positive msg_len would describe a different
+         * record boundary and can not be resumed without corrupting the
+         * stream, so retain the fatal invariant check from the single-record
+         * implementation.
          */
-        if (ret >= 0 && ret != sizeof(cf)) {
-            errorf("Incomplete CAN frame write (size=%d)", ret);
+        if (!ret) {
+            errorf("Incomplete CAN frame batch write (count=0)");
             pollreactor_do_exit(sq->pr);
             return;
         }
@@ -548,9 +583,19 @@ do_write(struct serialqueue *sq, void *buf, int buflen)
             }
             return;
         }
+        int sent_bytes = 0;
+        for (i=0; i<ret; i++) {
+            if (msgs[i].msg_len != sizeof(frames[i])) {
+                errorf("Incomplete CAN frame write (size=%u)",
+                       msgs[i].msg_len);
+                pollreactor_do_exit(sq->pr);
+                return;
+            }
+            sent_bytes += frames[i].can_dlc;
+        }
         sq->last_write_fail_time = 0.0;
-        data += size;
-        buflen -= size;
+        data += sent_bytes;
+        buflen -= sent_bytes;
     }
 }
 
