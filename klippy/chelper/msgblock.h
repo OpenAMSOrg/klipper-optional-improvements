@@ -4,6 +4,10 @@
 #include <stdint.h> // uint8_t
 #include "list.h" // struct list_node
 
+// On-wire message block:
+//   <length> <sequence> <encoded payload> <crc high> <crc low> <sync>
+// The length covers the entire block.  The low sequence bits are the rolling
+// message number and the remaining sequence bits are reserved.
 #define MESSAGE_MIN 5
 #define MESSAGE_MAX 64
 #define MESSAGE_HEADER_SIZE  2
@@ -39,12 +43,14 @@ struct clock_estimate {
     double conv_time, est_freq;
 };
 
-uint16_t msgblock_crc16_ccitt(uint8_t *buf, uint8_t len);
-int msgblock_check(uint8_t *need_sync, uint8_t *buf, int buf_len);
-int msgblock_decode(uint32_t *data, int data_len, uint8_t *msg, int msg_len);
+uint16_t msgblock_crc16_ccitt(const uint8_t *buf, uint8_t len);
+void msgblock_finalize(uint8_t *buf, uint8_t msg_len, uint8_t sequence);
+int msgblock_check(uint8_t *need_sync, const uint8_t *buf, int buf_len);
+int msgblock_decode(uint32_t *data, int data_len
+                    , const uint8_t *msg, int msg_len);
 struct queue_message *message_alloc(void);
-struct queue_message *message_fill(uint8_t *data, int len);
-struct queue_message *message_alloc_and_encode(uint32_t *data, int len);
+struct queue_message *message_fill(const uint8_t *data, int len);
+struct queue_message *message_alloc_and_encode(const uint32_t *data, int len);
 void message_free(struct queue_message *qm);
 void message_queue_free(struct list_head *root);
 uint64_t clock_from_clock32(uint64_t last_clock, uint32_t clock32);
