@@ -24,6 +24,22 @@ struct canbus_msg {
 
 #define CANMSG_DATA_LEN(msg) ((msg)->dlc > 8 ? 8 : (msg)->dlc)
 
+static inline void
+canbus_normalize_msg(struct canbus_msg *msg)
+{
+    /*
+     * Classical CAN controllers expose a four-bit DLC field, including raw
+     * encodings 9 through 15, even though a classical frame never carries more
+     * than eight data bytes.  Klipper deliberately uses an eight-byte payload
+     * and the gs_usb classic-frame ABI requires its published can_dlc to be in
+     * the range 0..8.  Normalize once at each hardware receive boundary so the
+     * bounded storage length and the length advertised to every later layer
+     * can not disagree.  Keep a legal RTR DLC because it describes the amount
+     * of data requested even though no payload bytes accompany that frame.
+     */
+    msg->dlc = CANMSG_DATA_LEN(msg);
+}
+
 struct canbus_status {
     uint32_t rx_error, tx_error, tx_retries;
     uint32_t bus_state;

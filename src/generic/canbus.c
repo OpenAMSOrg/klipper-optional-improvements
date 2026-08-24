@@ -32,5 +32,6 @@ canbus_notify_tx(void)
 void
 canbus_process_data(struct canbus_msg *msg)
 {
+    canbus_normalize_msg(msg);
     canserial_process_data(msg);
 }

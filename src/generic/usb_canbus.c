@@ -467,6 +467,7 @@ canbus_notify_tx(void)
 void
 canbus_process_data(struct canbus_msg *msg)
 {
+    canbus_normalize_msg(msg);
     // Add to admin command queue
     uint32_t pushp = UsbCan.canhw_push_pos;
     uint32_t pullp = readl(&UsbCan.canhw_pull_pos);
