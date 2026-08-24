@@ -6,6 +6,13 @@
 import math, logging, importlib
 import mcu, chelper, kinematics.extruder
 
+# math.isfinite() is unavailable on Python 2.
+try:
+    isfinite = math.isfinite
+except AttributeError:
+    def isfinite(value):
+        return not (math.isnan(value) or math.isinf(value))
+
 # Common suffixes: _d is distance (in mm), _v is velocity (in
 #   mm/second), _v2 is velocity squared (mm^2/s^2), _t is time (in
 #   seconds), _r is ratio (scalar between 0.0 and 1.0)
@@ -381,7 +388,7 @@ class ToolHead:
     def get_position(self):
         return list(self.commanded_pos)
     def set_position(self, newpos, homing_axes=""):
-        if any(math.isnan(pos) or math.isinf(pos) for pos in newpos):
+        if not all(map(isfinite, newpos)):
             raise self.printer.command_error("Invalid toolhead position")
         self.flush_step_generation()
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -395,8 +402,8 @@ class ToolHead:
         if last_move is not None:
             last_move.limit_next_junction_speed(speed)
     def move(self, newpos, speed):
-        if ((math.isnan(speed) or math.isinf(speed)) or speed <= 0.
-            or any(math.isnan(pos) or math.isinf(pos) for pos in newpos)):
+        if (not isfinite(speed) or speed <= 0.
+            or not all(map(isfinite, newpos))):
             raise self.printer.command_error("Invalid toolhead move")
         move = Move(self, self.commanded_pos, newpos, speed)
         if not move.move_d:

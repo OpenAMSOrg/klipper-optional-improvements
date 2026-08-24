@@ -5,13 +5,20 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, re, logging, collections, shlex, operator, math
 
+# math.isfinite() is unavailable on Python 2.
+try:
+    isfinite = math.isfinite
+except AttributeError:
+    def isfinite(value):
+        return not (math.isnan(value) or math.isinf(value))
+
 # Prevent unbounded buffering of an unterminated input command
 MAX_COMMAND_LENGTH = 1024 * 1024
 
 def parse_float(value):
     # Non-finite values bypass normal minval and maxval comparisons
     value = float(value)
-    if math.isnan(value) or math.isinf(value):
+    if not isfinite(value):
         raise ValueError("non-finite value")
     return value
 
