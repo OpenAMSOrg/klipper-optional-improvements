@@ -30,24 +30,19 @@ static uint8_t can_tx_waiting;
 int
 canhw_send(struct canbus_msg *msg)
 {
-    /*
-     * can2040 reports every successful transmit through its callback, but the
-     * routing task needs that notification only after can2040_transmit() has
-     * rejected a frame because its four-entry software queue is full.  Record
-     * that condition with PIO interrupts masked.  The library advances its
-     * consumer index and invokes the callback in that interrupt, so publishing
-     * the waiter before interrupts are restored closes the completion-versus-
-     * rejection race without changing can2040's queue implementation.
-     */
+    // Publish a capacity waiter atomically with the full-queue check.  Only
+    // tasks add frames, and interrupts can only free slots, so available
+    // capacity remains available after restoring interrupts.  Keep can2040's
+    // CRC calculation and bit stuffing outside this critical section.
     irqstatus_t flag = irq_save();
-    int ret = can2040_transmit(&cbus, (void*)msg);
-    if (ret < 0) {
+    if (!can2040_check_transmit(&cbus)) {
         writeb(&can_tx_waiting, 1);
         irq_restore(flag);
         return -1;
     }
     writeb(&can_tx_waiting, 0);
     irq_restore(flag);
+    can2040_transmit(&cbus, (void*)msg);
     return CANMSG_DATA_LEN(msg);
 }
 
