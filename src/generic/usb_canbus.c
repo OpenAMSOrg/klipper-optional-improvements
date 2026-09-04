@@ -995,6 +995,11 @@ DECL_TASK(usb_ep0_task);
 void
 usb_shutdown(void)
 {
+    // Shutdown removed the stall timer; let the task arm a new deadline.
+    if (UsbCan.bus_send_state == BSS_BLOCKING) {
+        UsbCan.bus_send_state = BSS_READY;
+        writeb(&UsbCan.bus_send_timed_out, 0);
+    }
     wake_usbcan_task();
     usb_notify_ep0();
 }
