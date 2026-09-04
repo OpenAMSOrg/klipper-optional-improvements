@@ -294,25 +294,16 @@ CAN_IRQHandler(void)
             canbus_notify_tx();
         }
     }
-    if (ir & MCAN_IR_BO) {
-        /*
-         * The M_CAN core enters software-initialization mode by setting INIT
-         * when its transmit error counter reaches bus-off.  In that mode it is
-         * completely disconnected from the bus and will remain so even after
-         * the wiring fault disappears; there is no automatic bus-off-management
-         * option.  Clear INIT after acknowledging the event to start the ISO
-         * CAN recovery sequence.  The controller still waits for the required
-         * 129 occurrences of 11 recessive bits, so this does not bypass or
-         * shorten the protocol's recovery safety interval.
-         */
-        CANx->MCAN_IR = MCAN_IR_BO;
-        CAN_Errors.bus_off++;
-        CANx->MCAN_CCCR &= ~MCAN_CCCR_INIT;
-    }
-    if (ir & (MCAN_IR_PED | MCAN_IR_PEA)) {
-        // Bus error
+    if (ir & (MCAN_IR_BO | MCAN_IR_PED | MCAN_IR_PEA)) {
+        // PSR reads clear LEC; share one snapshot for state and error handling.
         uint32_t psr = CANx->MCAN_PSR;
-        CANx->MCAN_IR = MCAN_IR_PED | MCAN_IR_PEA;
+        CANx->MCAN_IR = ir & (MCAN_IR_BO | MCAN_IR_PED | MCAN_IR_PEA);
+        if ((ir & MCAN_IR_BO) && (psr & MCAN_PSR_BO)) {
+            // BO interrupts on entry and recovery.  Count only entry, and
+            // clear INIT to start the controller's ISO CAN recovery sequence.
+            CAN_Errors.bus_off++;
+            CANx->MCAN_CCCR &= ~MCAN_CCCR_INIT;
+        }
         uint32_t lec = psr & MCAN_PSR_LEC_Msk;
         if (lec && lec != 7) {
             if (lec >= 3 && lec <= 5)
