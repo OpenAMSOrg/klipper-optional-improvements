@@ -55,6 +55,24 @@ mcu is configured to use canbus):
   "passive" for a bus that will no longer transmit canbus error
   frames, or "off" for a bus that will no longer transmit or receive
   messages).
+- `rx_overflows`: The number of receive queue overflow events detected
+  by the micro-controller, including hardware, command, administration,
+  and USB bridge receive queues. A hardware event may represent multiple
+  lost frames, so this is a lower bound on the number of dropped frames.
+- `tx_discards`: The number of frames discarded by a USB to CAN bus
+  bridge after its hardware transmit queue stalls.
+- `usb_invalid`: The number of malformed or unsupported USB CAN frame
+  records discarded by a USB to CAN bus bridge.
+- `bus_off`: The number of times the micro-controller CAN controller
+  entered the bus-off state.
+
+The `rx_overflows`, `tx_discards`, `usb_invalid`, and `bus_off` fields
+are queried approximately every five seconds. They are `None` until
+the first diagnostic response and remain `None` if the firmware does
+not support CAN diagnostics. The host extends these 32-bit firmware
+counters across rollover. Hardware overflow reporting is controller-dependent;
+`bus_off` is always zero on rp2XXX, and `tx_discards` and `usb_invalid`
+are zero on nodes that are not USB to CAN bus bridges.
 
 Note that only the rp2XXX micro-controllers report a non-zero
 `tx_retries` field and the rp2XXX micro-controllers always report
