@@ -261,6 +261,7 @@ class MessageParser:
         self.msgid_by_format = {}
         self.msgid_parser = PT_int32()
         self.config = {}
+        self.kconfig = None
         self.version = self.build_versions = ""
         self.raw_identify_data = ""
         self._init_messages(DefaultMessages)
@@ -501,6 +502,10 @@ class MessageParser:
             self._init_messages(all_messages, commands.values(),
                                 output.values())
             self.config.update(config)
+            kconfig = data.get('kconfig')
+            if kconfig is not None and type(kconfig) != str:
+                self._error("Invalid MCU identify data")
+            self.kconfig = kconfig
             self.version = data.get('version', '')
             self.build_versions = data.get('build_versions', '')
         except error as e:
@@ -518,6 +523,8 @@ class MessageParser:
         return dict(self.enumerations)
     def get_constants(self):
         return dict(self.config)
+    def get_kconfig(self):
+        return self.kconfig
     class sentinel: pass
     def get_constant(self, name, default=sentinel, parser=str):
         if name not in self.config:
