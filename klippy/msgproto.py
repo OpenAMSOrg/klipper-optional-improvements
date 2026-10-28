@@ -7,8 +7,10 @@ import json, zlib, logging, math
 
 try:
     integer_types = (int, long)
+    string_types = (str, unicode)
 except NameError:
     integer_types = (int,)
+    string_types = (str,)
 
 DefaultMessages = {
     "identify_response offset=%u data=%.*s": 0,
@@ -503,7 +505,7 @@ class MessageParser:
                                 output.values())
             self.config.update(config)
             kconfig = data.get('kconfig')
-            if kconfig is not None and type(kconfig) != str:
+            if kconfig is not None and not isinstance(kconfig, string_types):
                 self._error("Invalid MCU identify data")
             self.kconfig = kconfig
             self.version = data.get('version', '')
