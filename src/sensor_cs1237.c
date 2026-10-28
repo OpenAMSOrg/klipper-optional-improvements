@@ -30,7 +30,7 @@ struct cs1237_adc {
 
 enum {
     CS_PENDING = 1<<0, CS_OVERFLOW = 1<<1,
-    CS_CONFIG_PENDING = 1<<2, CS_CONFIG_VERIFY = 1<<3,
+    CS_DID_RESTART = 1<<2, CS_CONFIG_PENDING = 1<<3, CS_CONFIG_VERIFY = 1<<4,
 };
 
 // Internal errors transmitted in sample reports
@@ -99,21 +99,9 @@ cs1237_read_bits(struct cs1237_adc *cs, uint_fast8_t num_bits)
 }
 
 static void
-cs1237_clock_pulses(struct cs1237_adc *cs, uint_fast8_t count)
+cs1237_write_bits(struct cs1237_adc *cs, uint32_t value, uint_fast8_t num_bits)
 {
-    while (count--) {
-        irq_disable();
-        gpio_out_write(cs->sclk, 1);
-        cs1237_delay_noirq();
-        gpio_out_write(cs->sclk, 0);
-        irq_enable();
-        cs1237_delay();
-    }
-}
-
-static void
-cs1237_write_bits(struct cs1237_adc *cs, uint32_t value, uint32_t mask)
-{
+    uint32_t mask = 1 << (num_bits - 1);
     while (mask) {
         gpio_out_write(cs->dout_out, !!(value & mask));
         cs1237_delay();
@@ -127,19 +115,18 @@ cs1237_write_bits(struct cs1237_adc *cs, uint32_t value, uint32_t mask)
     }
 }
 
-// Called immediately after the 24 ADC data clocks. Clocks 25-29 announce a
+// Clocks 1-24 read pending sample (which is ignored). clocks 25-29 announce a
 // command, clocks 30-36 contain the seven bit command, clock 37 changes bus
 // direction, clocks 38-45 contain Config, and clock 46 releases DRDY/DOUT.
 static void
 cs1237_write_config(struct cs1237_adc *cs)
 {
-    cs1237_clock_pulses(cs, 5);
+    cs1237_read_bits(cs, 24 + 5);
+    uint32_t cmd = (CS1237_WRITE_CONFIG << 9) | (1 << 8) | cs->config;
     gpio_out_reset(cs->dout_out, 0);
-    cs1237_write_bits(cs, CS1237_WRITE_CONFIG, 0x40);
-    cs1237_clock_pulses(cs, 1);
-    cs1237_write_bits(cs, cs->config, 0x80);
+    cs1237_write_bits(cs, cmd, 7 + 1 + 8);
     gpio_in_reset(cs->dout, 0);
-    cs1237_clock_pulses(cs, 1);
+    cs1237_read_bits(cs, 1);
 }
 
 static uint_fast8_t
@@ -179,54 +166,73 @@ add_sample(struct cs1237_adc *cs, uint8_t oid, uint32_t counts)
 }
 
 static void
+cs1237_handle_startup(struct cs1237_adc *cs)
+{
+    if (cs->flags & CS_DID_RESTART) {
+        // Discard the first sample (as the read may not have been synchronized)
+        cs1237_read_bits(cs, 27);
+        irq_disable();
+        cs->flags &= ~(CS_DID_RESTART | CS_PENDING | CS_OVERFLOW);
+        irq_enable();
+        return;
+    }
+
+    // Send configuration
+    cs1237_write_config(cs);
+    irq_disable();
+    cs->flags = ((cs->flags | CS_CONFIG_VERIFY)
+                 & ~(CS_CONFIG_PENDING | CS_PENDING | CS_OVERFLOW));
+    irq_enable();
+}
+
+static void
+cs1237_handle_config_verify(struct cs1237_adc *cs, uint_fast8_t error)
+{
+    irq_disable();
+    cs->flags &= ~CS_CONFIG_VERIFY;
+    if (error)
+        cs->flags |= CS_CONFIG_PENDING;
+    else
+        cs->is_configured = 1;
+    irq_enable();
+}
+
+static void
 cs1237_read_adc(struct cs1237_adc *cs, uint8_t oid)
 {
-    uint8_t old_flags = cs->flags;
-    uint32_t raw;
-
-    if (old_flags & CS_CONFIG_PENDING) {
-        // Read and discard the sample produced with the power-on settings.
-        raw = cs1237_read_bits(cs, 24);
-        cs1237_write_config(cs);
-    } else {
-        // Bits 25-27 are update1, reserved zero, and forced high.
-        raw = cs1237_read_bits(cs, 27);
+    if (cs->flags & (CS_DID_RESTART|CS_CONFIG_PENDING)) {
+        // Handle initial startup
+        cs1237_handle_startup(cs);
+        return;
     }
+
+    // Bits 25-26 are update1 and a reserved zero.  Clock 27 only
+    // forces DOUT high until the next conversion is ready - its
+    // level depends on when the chip drives the line, not on the
+    // conversion, so discard it instead of checking it.
+    uint32_t raw = cs1237_read_bits(cs, 27) >> 1;
 
     irq_disable();
-    old_flags |= cs->flags;
-    cs->flags &= ~(CS_PENDING | CS_OVERFLOW);
-    if (old_flags & CS_CONFIG_PENDING) {
-        cs->flags &= ~CS_CONFIG_PENDING;
-        cs->flags |= CS_CONFIG_VERIFY;
-    }
+    uint_fast8_t old_flags = cs->flags;
+    cs->flags = old_flags & ~(CS_PENDING | CS_OVERFLOW);
     irq_enable();
 
-    if (old_flags & CS_CONFIG_PENDING)
-        return;
-
-    uint_fast8_t status = raw & 0x07;
-    uint32_t counts = raw >> 3;
+    uint_fast8_t status = raw & 0x03;
+    uint32_t counts = raw >> 2;
     if (counts & 0x800000)
         counts |= 0xff000000;
 
     uint_fast8_t error = 0;
-    if ((status & 0x03) != 0x01)
+    if (status & 0x01)
         error = SE_DESYNC;
-    else if ((old_flags & CS_CONFIG_VERIFY) && !(status & 0x04))
+    else if ((old_flags & CS_CONFIG_VERIFY) && !(status & 0x02))
         error = SE_CONFIG;
     else if (old_flags & CS_OVERFLOW)
         error = SE_READ_TOO_LONG;
 
-    if (old_flags & CS_CONFIG_VERIFY) {
-        irq_disable();
-        cs->flags &= ~CS_CONFIG_VERIFY;
-        if (error)
-            cs->flags |= CS_CONFIG_PENDING;
-        else
-            cs->is_configured = 1;
-        irq_enable();
-    }
+    if (old_flags & CS_CONFIG_VERIFY)
+        cs1237_handle_config_verify(cs, error);
+
     if (error) {
         trigger_analog_note_error(cs->ta, error);
         counts = (uint32_t)error << 24;
@@ -276,8 +282,9 @@ command_query_cs1237(uint32_t *args)
     }
     gpio_in_reset(cs->dout, 0);
     gpio_out_write(cs->sclk, 0);
+    cs->flags = CS_DID_RESTART;
     if (!cs->is_configured)
-        cs->flags = CS_CONFIG_PENDING;
+        cs->flags |= CS_CONFIG_PENDING;
     sensor_bulk_reset(&cs->sb);
     irq_disable();
     cs->timer.waketime = timer_read_time() + cs->rest_ticks;
