@@ -990,11 +990,13 @@ class OpenAMSWalkTests(unittest.TestCase):
         for _ in range(4):
             rows = b.turn(1)
             labels.append(b.cursor_row())
-        self.assertEqual(labels, ["PLA 55C 6h?", "PETG 65C 6h?",
-                                  "ABS 65C 6h?", "TPU 55C 6h?"])
-        b.turn(-2, "Two counter-clockwise detents back")
+        # The AMS 2 Pro's own list (Bambu's presets; ABS from OpenAMS at
+        # 65 C, the unit's maximum, for twice the AMS HT time).
+        self.assertEqual(labels, ["PLA 45C 12h?", "PETG 65C 12h?",
+                                  "TPU 65C 12h?", "ABS 65C 16h?"])
+        b.turn(-2, "Two counter-clockwise detents back to PETG")
         b.click("Click: started")
-        self.assertIn("OAMS_DRYER_START OAMS=2 TARGET=65 DURATION=21600",
+        self.assertIn("OAMS_DRYER_START OAMS=2 TARGET=65 DURATION=43200",
                       b.printer.gcode.scripts)
 
     def test_a_setting_is_one_click(self):
