@@ -4652,6 +4652,20 @@ lcd_type:
 #menu_reverse_navigation:
 #   When enabled it will reverse up and down directions for list
 #   navigation. The default is False. This parameter is optional.
+#menu_long_press_back: True
+#   When enabled, a long press of the encoder button goes back one
+#   level (and leaves the menu from its root), as the ".." entry does,
+#   instead of running the selected entry as a click would. An open
+#   input keeps the long press for its own script. The default is
+#   True.
+#menu_live_update: True
+#   When enabled, the shown list evaluates its entries' "enable"
+#   templates on every redraw, so entries appear and disappear with
+#   the printer's state while the list is open. When the selected
+#   entry disappears the cursor goes to the list's ".." row. An error
+#   in an enable template keeps the previous rows and is logged once.
+#   When disabled, enable is evaluated only on entering a list. The
+#   default is True.
 #encoder_pins:
 #   The pins connected to encoder. 2 pins must be provided when using
 #   encoder. This parameter must be provided when using menu.
@@ -5045,7 +5059,8 @@ information on menu attributes available during template rendering.
 #                 configurations using "some_list" as a prefix - for
 #                 example: [menu some_list some_item_in_the_list]
 #       vsdlist - same as 'list' but will append files from virtual sdcard
-#                 (will be removed in the future)
+#                 (will be removed in the future). Files are listed only
+#                 while no print is printing or paused.
 #name:
 #   Name of menu item - evaluated as a template.
 #enable:
@@ -5059,6 +5074,20 @@ information on menu attributes available during template rendering.
 #name:
 #enable:
 #   See above for a description of these parameters.
+
+#[menu some_vsdlist]
+#type: vsdlist
+#name:
+#enable:
+#   See above for a description of these parameters.
+#sort_by_date: False
+#   List the newest files first instead of by name.
+#file_click: select
+#   What a click on a file does: "select" selects it (M23) for a
+#   "Start printing" entry; "confirm" opens a list holding "Print it",
+#   which starts the print (SDCARD_PRINT_FILE) and leaves the menu.
+#   "Print it" refuses at the click while a print is printing or
+#   paused. The default is select.
 
 #[menu some_list some_command]
 #type: command

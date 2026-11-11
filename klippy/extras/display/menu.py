@@ -112,7 +112,14 @@ class MenuElement(object):
 
     def eval_enable(self, context):
         if self._enable_tpl is not None:
-            return bool(ast.literal_eval(self._enable_tpl.render(context)))
+            if self.manager.quiet_enable:
+                # The redraw refresh renders the bare template: its errors
+                # reach the refresh, which logs once instead of on every
+                # redraw (TemplateWrapper.render logs each failure).
+                text = self._enable_tpl.template.render(context)
+            else:
+                text = self._enable_tpl.render(context)
+            return bool(ast.literal_eval(text))
         return bool(self._enable)
 
     # Called when a item is selected
@@ -348,7 +355,25 @@ class MenuContainer(MenuElement):
     def update_items(self):
         _a = [(item, name) for item, name in self._allitems
               if item.is_enabled()]
-        self._items, self._names = zip(*_a) or ([], [])
+        if _a:
+            self._items, self._names = zip(*_a)
+        else:
+            self._items, self._names = (), ()
+
+    def refresh_items(self):
+        """Evaluate every row's enable again (called on each redraw). The
+        cursor stays on the entry it was on; when that entry is gone it goes
+        to the first row, the '..' of a list, never to whatever slid into its
+        place, so a click already under way only goes back. Returns True when
+        the rows changed."""
+        current = self.selected_item()
+        before = self._items
+        self.update_items()
+        if self._items == before:
+            return False
+        index = self._index_of(current) if current is not None else None
+        self.select_at(0 if index is None else index)
+        return True
 
     # select methods
     def init_selection(self):
@@ -664,15 +689,90 @@ class MenuVSDList(MenuList):
         super(MenuVSDList, self).__init__(manager, config, **kwargs)
         # order files by modification time (newest first) instead of by name
         self._sort_by_date = config.getboolean('sort_by_date', False)
+        # select: a file click only selects the file (M23), and "Start
+        # printing" starts it. confirm: a file click opens "Print it", which
+        # starts the print and leaves the menu for the status screen.
+        self._file_click = config.getchoice(
+            'file_click', ['select', 'confirm'], 'select')
+
+    def print_busy(self):
+        """Why a file must not be started or selected now, or None. While a
+        print is printing or paused, selecting or starting a file throws the
+        print away (virtual_sdcard resets it), so neither is offered."""
+        printer = self.manager.printer
+        sdcard = printer.lookup_object('virtual_sdcard', None)
+        if sdcard is None:
+            return "there is no virtual_sdcard"
+        if sdcard.is_active():
+            return "a print is running"
+        stats = printer.lookup_object('print_stats', None)
+        if stats is not None:
+            eventtime = printer.get_reactor().monotonic()
+            state = stats.get_status(eventtime).get('state')
+            if state in ('printing', 'paused'):
+                return "a print is %s" % (state,)
+        return None
 
     def _populate(self):
         super(MenuVSDList, self)._populate()
         sdcard = self.manager.printer.lookup_object('virtual_sdcard', None)
-        if sdcard is not None:
-            files = sdcard.get_file_list(sort_by_date=self._sort_by_date)
-            for fname, fsize in files:
-                self.insert_item(self.manager.menuitem_from(
-                    'command', name=repr(fname), gcode='M23 /%s' % str(fname)))
+        if sdcard is None or self.print_busy() is not None:
+            return
+        files = sdcard.get_file_list(sort_by_date=self._sort_by_date)
+        for fname, fsize in files:
+            if self._file_click == 'confirm':
+                if '"' in fname:
+                    # FILENAME="..." cannot carry it; select mode can.
+                    continue
+                self.insert_item(MenuVSDFile(self.manager, self, fname))
+            else:
+                self.insert_item(MenuVSDSelect(
+                    self.manager, self, name=repr(fname),
+                    gcode='M23 /%s' % str(fname)))
+
+
+class MenuVSDSelect(MenuCommand):
+    """A file row of a select-mode vsdlist: shown only while no print is
+    printing or paused (on a redraw too, with live updates)."""
+    def __init__(self, manager, vsdlist, **kwargs):
+        super(MenuVSDSelect, self).__init__(manager, None, **kwargs)
+        self._vsdlist = vsdlist
+
+    def is_enabled(self):
+        return self._vsdlist.print_busy() is None
+
+
+class MenuVSDFile(MenuList):
+    """A file row of a confirm-mode vsdlist: a list holding '..' and "Print
+    it". The row and "Print it" are shown only while no print is printing or
+    paused, and "Print it" asks again at the click, since a print can be
+    paused from elsewhere while the menu is open."""
+    def __init__(self, manager, vsdlist, fname):
+        super(MenuVSDFile, self).__init__(manager, None, name=repr(fname))
+        self._vsdlist = vsdlist
+        self._fname = fname
+        self._print_item = MenuVSDSelect(
+            manager, vsdlist, name='Print it', gcode=self._start)
+
+    def is_enabled(self):
+        return self._vsdlist.print_busy() is None
+
+    def _names_aslist(self):
+        return []
+
+    def _populate(self):
+        super(MenuVSDFile, self)._populate()
+        self.insert_item(self._print_item)
+
+    def _start(self, element, context):
+        why = self._vsdlist.print_busy()
+        if why is not None:
+            self.manager.gcode.respond_info(
+                "%s was not started: %s" % (self._fname, why))
+            self.manager.back()
+            return ""
+        self.manager.exit(True)
+        return 'SDCARD_PRINT_FILE FILENAME="%s"' % (self._fname,)
 
 
 menu_items = {
@@ -707,6 +807,15 @@ class MenuManager:
         # reverse container navigation
         self._reverse_navigation = config.getboolean(
             'menu_reverse_navigation', False)
+        # a long press goes back (unless an input is open, where it keeps
+        # its meaning), instead of acting like a click
+        self._long_press_back = config.getboolean(
+            'menu_long_press_back', True)
+        # evaluate the rows' enable on every redraw, not only on entering a
+        # list, so the rows follow the printer's state
+        self._live_update = config.getboolean('menu_live_update', True)
+        self.quiet_enable = False
+        self._refresh_error = None
         # load printer objects
         self.gcode_macro = self.printer.load_object(config, 'gcode_macro')
         # register itself for printer callbacks
@@ -849,9 +958,32 @@ class MenuManager:
         self.update_context(eventtime)
         container = self.stack_peek()
         if self.running and isinstance(container, MenuContainer):
+            self.refresh_container(container)
             container.heartbeat(eventtime)
             container.draw_container(self.rows, eventtime)
         return True
+
+    def refresh_container(self, container):
+        """Live rows: evaluate the shown list's enable templates again. Not
+        while an input is open. An error in any of them must not leave this
+        reactor timer, so it is caught: the previous rows stay, and it is
+        logged once until a refresh succeeds again."""
+        if not self._live_update or container.is_editing():
+            return
+        self.quiet_enable = True
+        try:
+            container.refresh_items()
+        except Exception as e:
+            message = "%s: %s" % (type(e).__name__, e)
+            if self._refresh_error is None:
+                logging.exception(
+                    "Menu: an enable template failed on a redraw (%s); the"
+                    " rows stay as they were", message)
+            self._refresh_error = message
+        else:
+            self._refresh_error = None
+        finally:
+            self.quiet_enable = False
 
     def up(self, fast_rate=False):
         container = self.stack_peek()
@@ -930,6 +1062,16 @@ class MenuManager:
         if self.running and isinstance(container, MenuContainer):
             self.timer = 0
             current = container.selected_item()
+            if (event == 'long_click' and self._long_press_back
+                    and not (isinstance(current, MenuInput)
+                             and current.is_editing())):
+                # A shortcut for the ".." row, which stays first in every
+                # list. A long press used to run the entry under the cursor
+                # just as a click does ("Restart FW", "Yes, cancel it");
+                # now it never runs an entry. An open input keeps the long
+                # press (the delta calibration entries act on it).
+                self.back()
+                return
             if isinstance(current, MenuContainer):
                 self.stack_push(current)
             elif isinstance(current, MenuInput):
