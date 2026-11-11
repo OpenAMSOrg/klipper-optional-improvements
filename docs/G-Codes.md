@@ -1732,7 +1732,8 @@ In addition, the following extended commands are available when the
 
 #### SDCARD_PRINT_FILE
 `SDCARD_PRINT_FILE FILENAME=<filename>`: Load a file and start SD
-print.
+print. It is refused while a print is paused, as `M23` is: loading a
+file would reset the paused print. Resume or cancel that print first.
 
 #### SDCARD_RESET_FILE
 `SDCARD_RESET_FILE`: Unload file and clear SD state.

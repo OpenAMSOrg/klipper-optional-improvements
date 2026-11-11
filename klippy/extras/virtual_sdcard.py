@@ -183,11 +183,18 @@ class VirtualSD:
             raise gcmd.error(
                 "SDCARD_RESET_FILE cannot be run from the sdcard")
         self._reset_file()
+    def _check_not_paused(self, gcmd):
+        # Loading a file resets the print state, so in a pause it would
+        # throw the paused print away (no cancel, no park).
+        if self.print_stats.state == "paused":
+            raise gcmd.error("SD busy: a print is paused; resume it or"
+                             " cancel it before loading another file")
     cmd_SDCARD_PRINT_FILE_help = "Loads a SD file and starts the print.  May "\
         "include files in subdirectories."
     def cmd_SDCARD_PRINT_FILE(self, gcmd):
         if self.work_timer is not None:
             raise gcmd.error("SD busy")
+        self._check_not_paused(gcmd)
         self._reset_file()
         filename = gcmd.get("FILENAME")
         if not filename:
@@ -210,6 +217,7 @@ class VirtualSD:
         # Select SD file
         if self.work_timer is not None:
             raise gcmd.error("SD busy")
+        self._check_not_paused(gcmd)
         self._reset_file()
         filename = gcmd.get_raw_command_parameters().strip()
         if filename.startswith('/'):
