@@ -698,19 +698,25 @@ class MenuVSDList(MenuList):
     def print_busy(self):
         """Why a file must not be started or selected now, or None. While a
         print is printing or paused, selecting or starting a file throws the
-        print away (virtual_sdcard resets it), so neither is offered."""
+        print away (virtual_sdcard resets it), so neither is offered. A print
+        streamed by OctoPrint leaves print_stats at standby, so the printer
+        being busy (idle_timeout "Printing") counts too."""
         printer = self.manager.printer
         sdcard = printer.lookup_object('virtual_sdcard', None)
         if sdcard is None:
             return "there is no virtual_sdcard"
         if sdcard.is_active():
             return "a print is running"
+        eventtime = printer.get_reactor().monotonic()
         stats = printer.lookup_object('print_stats', None)
         if stats is not None:
-            eventtime = printer.get_reactor().monotonic()
             state = stats.get_status(eventtime).get('state')
             if state in ('printing', 'paused'):
                 return "a print is %s" % (state,)
+        idle = printer.lookup_object('idle_timeout', None)
+        if idle is not None \
+                and idle.get_status(eventtime).get('state') == 'Printing':
+            return "the printer is busy"
         return None
 
     def _populate(self):
@@ -956,23 +962,32 @@ class MenuManager:
             return False
         # draw menu
         self.update_context(eventtime)
+        if self.running:
+            self.refresh_container()
         container = self.stack_peek()
         if self.running and isinstance(container, MenuContainer):
-            self.refresh_container(container)
             container.heartbeat(eventtime)
             container.draw_container(self.rows, eventtime)
         return True
 
-    def refresh_container(self, container):
-        """Live rows: evaluate the shown list's enable templates again. Not
-        while an input is open. An error in any of them must not leave this
-        reactor timer, so it is caught: the previous rows stay, and it is
-        logged once until a refresh succeeds again."""
-        if not self._live_update or container.is_editing():
+    def refresh_container(self):
+        """Live rows. First, an open list whose own enable has turned false
+        (Setup or a confirm in it, when a print starts) is left: the menu
+        goes back to the deepest list still enabled, with the cursor on its
+        '..', and an input left open in it is closed without running. Then
+        the shown list's rows are evaluated again, unless an input is open.
+        An error in any enable must not leave this reactor timer, so it is
+        caught: the previous rows stay, and it is logged once until a
+        refresh succeeds again."""
+        if not self._live_update:
             return
         self.quiet_enable = True
         try:
-            container.refresh_items()
+            self.leave_disabled_lists()
+            container = self.stack_peek()
+            if isinstance(container, MenuContainer) \
+                    and not container.is_editing():
+                container.refresh_items()
         except Exception as e:
             message = "%s: %s" % (type(e).__name__, e)
             if self._refresh_error is None:
@@ -984,6 +999,20 @@ class MenuManager:
             self._refresh_error = None
         finally:
             self.quiet_enable = False
+
+    def leave_disabled_lists(self):
+        """Back out of every open list from the first whose own enable is
+        false (the root list is never left). True when it backed out."""
+        for depth in range(1, self.stack_size()):
+            if self.menustack[depth].is_enabled():
+                continue
+            top = self.stack_peek()
+            if isinstance(top, MenuContainer):
+                top.stop_editing()
+            while self.stack_size() > depth:
+                self.stack_pop()
+            return True
+        return False
 
     def up(self, fast_rate=False):
         container = self.stack_peek()

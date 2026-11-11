@@ -10,6 +10,13 @@
 # with the buttons module (the encoder's two directions and the click pin),
 # so a long press is the real 0.8 s timer.
 #
+# The knob: menu_keys maps Klipper's encoder_cw_callback to "up" and
+# encoder_ccw_callback to "down"; which physical direction fires which
+# depends on the order of encoder_pins. On voron350's mini12864
+# (encoder_pins: ^EXP2_5, ^EXP2_3, as in the fixture) a physical clockwise
+# turn fires encoder_ccw_callback: clockwise moves the cursor down,
+# counter-clockwise up. Bench.turn() counts physical clockwise detents.
+#
 # Run (from the top of the tree, with the Python Klipper runs on):
 #   ~/klippy-env/bin/python -m unittest discover -s test/menu -p 'test_display_walk.py' -v
 #   ~/klippy-env/bin/python test/menu/test_display_walk.py --show
@@ -20,6 +27,7 @@
 #   OAMS_MENU_CFG      OpenAMS's oams_menu.cfg; the OpenAMS walks need it
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import collections
 import contextlib
 import logging
 import os
@@ -233,6 +241,10 @@ class HeadlessUC1701(uc1701.DisplayBase):
 # The printer around it
 # ---------------------------------------------------------------------------
 
+# Klipper's toolhead and gcode_move publish positions as a namedtuple.
+Coord = collections.namedtuple("Coord", ("x", "y", "z", "e"))
+
+
 class Status:
     def __init__(self, **values):
         self.values = values
@@ -380,6 +392,7 @@ class Buttons:
     def register_rotary_encoder(self, pin1, pin2, cw_callback, ccw_callback,
                                 steps_per_detent):
         self.encoder = (cw_callback, ccw_callback)
+        self.encoder_pins = (pin1, pin2)
 
     def register_buttons(self, pins, callback):
         self.click = callback
@@ -404,12 +417,12 @@ class Printer:
         self.objects["pause_resume"] = Status(is_paused=False)
         self.objects["virtual_sdcard"] = SDCard(files)
         self.objects["toolhead"] = Status(
-            homed_axes="xyz", position=[175., 175., 10., 0.],
-            axis_minimum=[0., 0., 0., 0.], axis_maximum=[350., 350., 340., 0.],
+            homed_axes="xyz", position=Coord(175., 175., 10., 0.),
+            axis_minimum=Coord(0., 0., 0., 0.), axis_maximum=Coord(350., 350., 340., 0.),
             extruder="extruder", estimated_print_time=0.)
         self.objects["gcode_move"] = Status(
             speed_factor=1., extrude_factor=1.,
-            homing_origin=[0., 0., 0., 0.], gcode_position=[175., 175., 10., 0.])
+            homing_origin=Coord(0., 0., 0., 0.), gcode_position=Coord(175., 175., 10., 0.))
         self.objects["extruder"] = Status(temperature=24., target=0.,
                                           can_extrude=False)
         self.objects["heater_bed"] = Status(temperature=23., target=0.)
@@ -587,12 +600,14 @@ class Bench:
         self.reactor.advance(0.15)
 
     def turn(self, detents, title=None):
-        """Positive: down the list. Each detent 0.1 s apart, slower than
-        menu_keys' fast rate."""
-        cw, ccw = self.printer.objects["buttons"].encoder
+        """Turn the knob: positive is physical clockwise, which on this
+        wiring fires Klipper's encoder_ccw_callback and moves the cursor
+        down; negative is counter-clockwise (encoder_cw_callback, up).
+        Each detent 0.1 s apart, slower than menu_keys' fast rate."""
+        klipper_cw, klipper_ccw = self.printer.objects["buttons"].encoder
         for _ in range(abs(detents)):
             self.reactor.advance(0.1)
-            (ccw if detents > 0 else cw)(self.reactor.now)
+            (klipper_ccw if detents > 0 else klipper_cw)(self.reactor.now)
             self.actions += 1
         self.settle()
         return self.screen(title)
@@ -714,12 +729,49 @@ class WalkTests(unittest.TestCase):
         self.assertIn("125%", rows[1])
         self.assertIn("42%", rows[2])
 
+    def test_a_physical_clockwise_detent_moves_the_cursor_down(self):
+        """voron350's owner: clockwise moves down, counter-clockwise up.
+        With its encoder_pins that is Klipper's ccw callback."""
+        b = self.b
+        self.assertEqual(
+            tuple(p.strip() for p in b.printer.objects["buttons"].encoder_pins),
+            ("^EXP2_5", "^EXP2_3"))
+        self.open_main("Main, cursor on ..")
+        b.turn(1, "One clockwise detent: down one row")
+        self.assertEqual(b.chip.text_rows()[1][0], ">")
+        b.turn(-1, "One counter-clockwise detent: back up")
+        self.assertEqual(b.chip.text_rows()[0][0], ">")
+
+    def test_a_print_starting_closes_each_confirm_left_open(self):
+        """The menu left on a confirm (no menu_timeout on voron350), and a
+        print started from Mainsail: the next redraw leaves the list whose
+        gate closed, so "Yes, restart" is not one click away."""
+        b = self.b
+        b.printer.objects["configfile"].values["save_config_pending"] = True
+        for path, yes in ((("Setup", "Restart", "Restart FW"), "Yes, restart"),
+                          (("Setup", "Restart", "Restart host"), "Yes, restart"),
+                          (("Setup", "Save config"), "Save & restart")):
+            b.printer.state("standby")
+            self.open_main()
+            for entry in path:
+                b.goto(entry)
+                b.click()
+            b.goto(yes, "%s open, cursor on %s" % (path[-1], yes))
+            b.printer.state("printing")         # started from Mainsail
+            b.reactor.advance(0.6)
+            rows = b.screen("A print starts: %s is left" % path[-1])
+            self.assertEqual(rows[0].rstrip(), ">..")
+            self.assertEqual(row_names(rows)[:3],
+                             ["..", "Pause print", "Cancel print"])
+            self.assertNotIn(yes, row_names(rows))
+        self.assertEqual(b.printer.gcode.scripts, [])
+
     def test_print_the_newest_file_in_eight_actions_with_no_going_back(self):
         b = self.b
         b.screen("Status screen, idle")
         b.actions = 0
         self.open_main("Main")
-        b.goto("SD Card", "Turn to SD Card")
+        b.goto("SD Card", "Turn clockwise to SD Card")
         rows = b.click("SD Card: newest file first")
         self.assertEqual(row_names(rows)[:3],
                          ["..", "newest.gcode", "benchy.gcode"])
@@ -727,7 +779,7 @@ class WalkTests(unittest.TestCase):
         rows = b.click("Click the file: its confirm")
         self.assertEqual(rows[0].rstrip(), ">..")
         self.assertEqual(row_names(rows)[:2], ["..", "Print it"])
-        b.turn(1, "Turn to Print it")
+        b.turn(1, "One clockwise detent to Print it")
         rows = b.click("Click Print it: the status screen")
         self.assertIn('SDCARD_PRINT_FILE FILENAME="newest.gcode"',
                       b.printer.gcode.scripts)
@@ -759,8 +811,10 @@ class WalkTests(unittest.TestCase):
                       b.printer.gcode.messages)
         self.assertTrue(b.menu_open())
         b.reactor.advance(0.6)
-        rows = b.screen("Next redraw: the files are gone, cursor on ..")
-        self.assertEqual(row_names(rows), ["..", "", "", ""])
+        rows = b.screen("Next redraw: SD Card's own gate closed, so the menu"
+                        " left it: Main, cursor on ..")
+        self.assertEqual(row_names(rows)[:3],
+                         ["..", "Resume print", "Cancel print"])
         self.assertEqual(rows[0].rstrip(), ">..")
 
     def test_a_paused_print_main_offers_resume_and_hides_what_ends_it(self):
@@ -938,7 +992,7 @@ class OpenAMSWalkTests(unittest.TestCase):
             labels.append(b.cursor_row())
         self.assertEqual(labels, ["PLA 55C 6h?", "PETG 65C 6h?",
                                   "ABS 65C 6h?", "TPU 55C 6h?"])
-        b.turn(-2, "Turn back to PETG 65C 6h?")
+        b.turn(-2, "Two counter-clockwise detents back")
         b.click("Click: started")
         self.assertIn("OAMS_DRYER_START OAMS=2 TARGET=65 DURATION=21600",
                       b.printer.gcode.scripts)

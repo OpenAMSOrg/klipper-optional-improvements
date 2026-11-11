@@ -4662,10 +4662,13 @@ lcd_type:
 #   When enabled, the shown list evaluates its entries' "enable"
 #   templates on every redraw, so entries appear and disappear with
 #   the printer's state while the list is open. When the selected
-#   entry disappears the cursor goes to the list's ".." row. An error
-#   in an enable template keeps the previous rows and is logged once.
-#   When disabled, enable is evaluated only on entering a list. The
-#   default is True.
+#   entry disappears the cursor goes to the list's ".." row. A list
+#   that is open when its own enable turns false is left, back to the
+#   deepest list still enabled, with the cursor on its ".." row (an
+#   input left open there is closed without running). An error in an
+#   enable template keeps the previous rows and is logged once. When
+#   disabled, enable is evaluated only on entering a list. The default
+#   is True.
 #encoder_pins:
 #   The pins connected to encoder. 2 pins must be provided when using
 #   encoder. This parameter must be provided when using menu.

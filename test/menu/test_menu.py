@@ -7,6 +7,7 @@
 # printer objects: no MCU, no display hardware.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import collections
 import contextlib
 import logging
 import os
@@ -98,6 +99,10 @@ class Reactor:
         return contextlib.nullcontext()
 
 
+# Klipper's toolhead and gcode_move publish positions as a namedtuple.
+Coord = collections.namedtuple("Coord", ("x", "y", "z", "e"))
+
+
 class Status:
     def __init__(self, **values):
         self.values = values
@@ -165,13 +170,16 @@ class Printer:
         self.objects["pause_resume"] = Status(is_paused=False)
         self.objects["virtual_sdcard"] = SDCard(["a.gcode", "b.gcode"])
         self.objects["toolhead"] = Status(
-            homed_axes="xyz", position=[0., 0., 10., 0.],
-            axis_minimum=[0., 0., 0., 0.], axis_maximum=[300., 300., 300., 0.])
+            homed_axes="xyz", position=Coord(0., 0., 10., 0.),
+            axis_minimum=Coord(0., 0., 0., 0.), axis_maximum=Coord(300., 300., 300., 0.))
         self.objects["flags"] = Status(a=True, b=True, c=True,
                                        boom={"value": {"deeper": True}})
         self.objects["heaters"] = Status(available_heaters=["extruder"])
         self.objects["extruder"] = Status(temperature=20., target=0.)
         self.objects["fan"] = Status(speed=0.)
+        self.objects["gcode_move"] = Status(
+            gcode_position=Coord(10., 10., 10., 0.), homing_origin=Coord(0., 0., 0., 0.),
+            speed_factor=1., extrude_factor=1.)
 
     def get_reactor(self):
         return self.reactor
@@ -566,6 +574,110 @@ class LongPressTests(unittest.TestCase):
         b.select("A")
         b.key("long_click")
         self.assertEqual(b.scripts, ["RUN_A"])
+
+
+class GateTests(unittest.TestCase):
+    """Hidden while a print is printing or paused: print_stats says so, or
+    idle_timeout says Printing (a print streamed by OctoPrint leaves
+    print_stats at standby)."""
+
+    def main_rows(self, bench):
+        return [row for row in bench.open()
+                if row not in ("Test", "Files", "Picks")]
+
+    def test_an_octoprint_print_hides_motion_and_shows_tune(self):
+        b = Bench()
+        b.printer.set("idle_timeout", state="Printing")
+        self.assertEqual(b.printer.objects["print_stats"].values["state"],
+                         "standby")
+        self.assertEqual(self.main_rows(b), [
+            "..", "Tune", "OctoPrint", "Control", "Temperature"])
+        self.assertEqual(b.open("Control"),
+                         ["..", "Fan: OFF", "Fan speed:   0%"])
+        files = b.menu.lookup_menuitem("__main __files")
+        self.assertEqual(files.print_busy(), "the printer is busy")
+
+    def test_preheat_and_cooldown_hide_while_printing_or_paused(self):
+        b = Bench()
+        idle = b.open("Temperature")
+        for entry in ("Preheat PLA", "Preheat ABS", "Cooldown"):
+            self.assertIn(entry, idle)
+        for state in ("printing", "paused"):
+            b = Bench()
+            b.printer.set("print_stats", state=state)
+            rows = b.open("Temperature")
+            for entry in ("Preheat PLA", "Preheat ABS", "Cooldown"):
+                self.assertNotIn(entry, rows, state)
+
+
+class LeaveClosedListsTests(unittest.TestCase):
+    """A list that is open when its own enable turns false is left on the
+    next redraw, back to the deepest list still enabled, cursor on '..'."""
+
+    def start_print(self, bench):
+        bench.printer.set("print_stats", state="printing")
+        bench.printer.set("idle_timeout", state="Printing")
+        bench.redraw()
+
+    def test_a_restart_confirm_left_open_is_left_when_a_print_starts(self):
+        for entry in ("Restart host", "Restart FW"):
+            b = Bench()
+            b.open("Setup", "Restart", entry)
+            b.select("Yes, restart")
+            self.start_print(b)
+            self.assertEqual(b.menu.stack_size(), 1, entry)
+            self.assertEqual(b.selected(), "..", entry)
+            self.assertNotIn("Setup", b.rows())
+            b.key("click")
+            self.assertEqual(b.scripts, [])
+            self.assertFalse(b.menu.is_running())
+
+    def test_the_save_config_confirm_is_left_too(self):
+        b = Bench()
+        b.printer.set("configfile", save_config_pending=True)
+        b.open("Setup", "Save config")
+        b.select("Save & restart")
+        self.start_print(b)
+        self.assertEqual(b.menu.stack_size(), 1)
+        self.assertEqual(b.selected(), "..")
+
+    def test_an_input_left_open_there_is_closed_without_running(self):
+        b = Bench()
+        b.open("Control", "Move 10mm")
+        b.select("Move X:010.0")
+        b.key("click")
+        b.key("down")
+        self.assertTrue(b.container().selected_item().is_editing())
+        self.start_print(b)
+        # Control has no gate of its own: it is the deepest list still
+        # enabled, with the cursor on its '..'.
+        self.assertEqual(b.menu.stack_size(), 2)
+        self.assertEqual(b.selected(), "..")
+        self.assertNotIn("Move 10mm", b.rows())
+        self.assertEqual(b.scripts, [])
+        b.key("click")                      # '..': back to Main
+        self.assertEqual(b.scripts, [])
+
+    def test_the_confirm_rows_have_their_own_gate(self):
+        b = Bench()
+        b.printer.set("configfile", save_config_pending=True)
+        names = ("__main __setup __restart __host_restart __yes",
+                 "__main __setup __restart __firmware_restart __yes",
+                 "__main __setup __save_config __yes")
+        b.menu.update_context(0.)
+        for name in names:
+            self.assertTrue(b.menu.lookup_menuitem(name).is_enabled(), name)
+        b.printer.set("print_stats", state="paused")
+        b.menu.update_context(1.)
+        for name in names:
+            self.assertFalse(b.menu.lookup_menuitem(name).is_enabled(), name)
+
+    def test_a_list_still_enabled_stays(self):
+        b = Bench()
+        b.open("Temperature")
+        self.start_print(b)
+        self.assertEqual(b.menu.stack_size(), 2)
+        self.assertNotIn("Cooldown", b.rows())
 
 
 if __name__ == "__main__":
